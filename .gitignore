@@ -176,3 +176,7 @@ cython_debug/
 
 # Custom local documentation directory
 /docs/
+
+# Runtime data directory served/written to by StaticFilesMiddleware -
+# created locally via `mkdir -p sandbox`, shouldn't hold committed test files
+/sandbox/

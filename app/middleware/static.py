@@ -8,6 +8,12 @@ class StaticFilesMiddleware:
     Implements security validation to prevent Directory Traversal attacks.
     Adheres to SOLID Single Responsibility Principle.
     """
+
+    # Files at or below this size are read fully into memory (simple, and
+    # gzip-eligible). Larger files are streamed in chunks via HTTPResponse's
+    # stream_path so a big download can't spike server memory.
+    STREAM_THRESHOLD_BYTES = 1 * 1024 * 1024
+
     def __init__(self, path_prefix: str, directory: str):
         self.path_prefix = path_prefix
         # Resolve to absolute path to guarantee secure traversal checks
@@ -23,7 +29,11 @@ class StaticFilesMiddleware:
         resolved_filepath = os.path.realpath(filepath)
 
         # 1. Path Traversal Validation
-        if not resolved_filepath.startswith(self.directory):
+        # Compare against the directory plus a trailing separator, not a bare
+        # prefix - otherwise a sibling directory like /data-evil would also
+        # satisfy startswith("/data").
+        if not (resolved_filepath == self.directory
+                or resolved_filepath.startswith(self.directory + os.sep)):
             return HTTPResponse(
                 status=403, 
                 headers={"Content-Type": "text/plain"}, 
@@ -34,13 +44,20 @@ class StaticFilesMiddleware:
         if request.method == "GET":
             if os.path.exists(filepath) and os.path.isfile(filepath):
                 try:
-                    with open(filepath, "rb") as f:
-                        response_body = f.read()
-                    
                     mime_type, _ = mimetypes.guess_type(filepath)
                     if mime_type is None:
                         mime_type = "application/octet-stream"
-                    
+
+                    if os.path.getsize(filepath) > self.STREAM_THRESHOLD_BYTES:
+                        return HTTPResponse(
+                            status=200,
+                            headers={"Content-Type": mime_type},
+                            stream_path=filepath,
+                        )
+
+                    with open(filepath, "rb") as f:
+                        response_body = f.read()
+
                     return HTTPResponse(
                         status=200,
                         headers={"Content-Type": mime_type},

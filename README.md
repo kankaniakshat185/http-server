@@ -1,19 +1,38 @@
 # Custom Python HTTP Server & Web Framework
 
-A modular, high-performance HTTP/1.1 server and lightweight framework built from scratch in Python. It uses an event-driven networking architecture with non-blocking I/O (`selectors`), a task-dispatching worker thread pool, Express-style middleware, dynamic path variable routing, and persistent HTTP/1.1 connections.
+A modular, high-performance HTTP/1.1 server and lightweight framework built from scratch in Python. It uses an event-driven networking architecture with non-blocking I/O (`selectors`), a task-dispatching worker thread pool, Express-style middleware, dynamic path variable routing, and persistent HTTP/1.1 connections - hardened with request-size limits, idle-connection timeouts, and a single-writer selector model, and backed by a 33-test pytest suite running in CI.
 
 ---
 
 ## Core Features
 
+### Networking & Concurrency
 * **Async Event Loop**: Event-driven network loop using I/O multiplexing (`selectors` wrapping `epoll`/`kqueue`) for non-blocking socket polling.
 * **ThreadPool Offloading**: Pre-allocated thread pool (`ThreadPoolExecutor`) to process routing handlers and file I/O tasks, keeping the event loop responsive.
+* **Single-Writer Selector Model**: Worker threads never call `selector.register()`/`unregister()` directly - `selectors.DefaultSelector` isn't safe to mutate concurrently with an in-progress `select()` call. Instead, they post a `("register"|"unregister", conn)` action onto a queue, and only the event-loop thread drains it and touches the selector.
+* **Per-Connection Locking**: Each connection's buffer/parse state is guarded by its own `threading.Lock()`, so two unrelated clients never contend with each other. A separate, coarse `sessions_lock` only guards structural inserts/removals from the connection table.
+* **Fault-Isolated Event Loop**: Every callback dispatched from the event loop (`_accept`, `_read`) is wrapped so one misbehaving connection (a bad `accept()`, a socket error) can never crash the whole server.
+* **Keep-Alive & Pipelining**: Persistent HTTP/1.1 connections, with support for multiple pipelined requests arriving in a single TCP read.
+
+### HTTP Protocol Handling
 * **Onion Middleware**: A recursive middleware chain pipeline (`request, next_handler`) resembling Express/Koa architecture.
 * **Parametric Routing**: Dynamic path parameter parsing and pattern matching (e.g., `/echo/:string`).
-* **Keep-Alive**: Support for persistent TCP connections to eliminate repetitive handshake overhead.
-* **GZIP Compression**: Automated runtime payload compression based on client request headers.
-* **Directory Traversal Defense**: Canonical path validation (`os.path.realpath`) blocking file access outside the sandbox folder.
+* **405 vs 404 Correctness**: A path that exists under a different HTTP method returns `405 Method Not Allowed` with a populated `Allow` header, instead of collapsing into a generic `404`.
+* **GZIP Compression**: Automated runtime payload compression based on client request headers, skipped automatically for already-compressed content-types (images, video, audio, zip, PDF) where recompressing would just burn CPU.
+* **Streamed Large File Responses**: Static files above 1MB are read and written in 64KB chunks (`HTTPResponse.stream_path`) instead of being buffered fully in memory; smaller files are still buffered (and gzip-eligible) for simplicity.
 * **MIME Resolution**: Automated header detection using the standard system mime database.
+
+### Security & Resilience
+* **Directory Traversal Defense**: Canonical path validation (`os.path.realpath`) blocking file access outside the sandbox folder - checked against a full path-separator boundary, not a bare string prefix, so a sibling directory (e.g. `data-evil` next to `data`) can't slip through.
+* **Required Sandbox Directory**: `--directory` must be passed explicitly; the server refuses to start rather than silently falling back to serving the current working directory.
+* **Request Size Limits**: Headers over 16KB or a declared `Content-Length` over 10MB are rejected (`400`/`413`) before being buffered, bounding memory use against a single oversized request.
+* **Idle Connection Timeout**: Any connection - stalled mid-request or sitting idle between keep-alive requests - is closed after 30 seconds of silence, the read-timeout mitigation for slow-drip (Slowloris-style) clients.
+* **Chunked Transfer-Encoding Rejection**: `Transfer-Encoding: chunked` requests get an explicit `501 Not Implemented` rather than being silently mis-parsed (which would previously desync the next pipelined request off unread chunk data).
+
+### Observability & Testing
+* **Structured Logging**: Access logs and crash traces go through the standard `logging` module (timestamps, levels, logger names) instead of raw `print()`; clients only ever see a generic `500` body, never internal exception details.
+* **Test Suite**: 33 pytest tests covering routing, request/response parsing, static-file traversal (including a regression test for the prefix-bypass bug), and real-socket integration tests for the shutdown deadlock, size limits, and status-code correctness.
+* **Continuous Integration**: GitHub Actions runs the full suite on every push and pull request (`.github/workflows/tests.yml`).
 
 ### Performance Highlights
 * **~1,200 requests/sec** throughput.
@@ -21,41 +40,90 @@ A modular, high-performance HTTP/1.1 server and lightweight framework built from
 * **~14.5% lower** average latency.
 * **~33% lower** tail latency.
 
+> These benchmark numbers were captured before the hardening pass above. The added
+> per-request size/encoding checks and idle-connection sweep are O(1)/cheap per
+> request and per event-loop tick respectively, but haven't been re-benchmarked yet.
+
 ---
 
 ## Architecture
 
+### Request Lifecycle
+
 ```mermaid
 graph TD
-    Client1[Client / Browser 1] -->|TCP Connection| ServerSocket[Server Socket :4221]
-    Client2[Client / Browser 2] -->|TCP Connection| ServerSocket
+    Client[Client] -->|TCP Connect| ServerSocket[Server Socket :4221]
+    ServerSocket --> EventLoop[Event Loop - selectors epoll/kqueue]
 
-    ServerSocket -->|Accepts Connection| EventLoop[Main Event Loop selectors]
-    
-    EventLoop -->|Non-blocking Read| RequestRead[Buffer Request Bytes]
-    RequestRead -->|Assemble full HTTP request| ThreadPool[ThreadPoolExecutor Worker Pool]
-    
-    subgraph "Thread Pool Tasks"
-    ThreadPool -->|Worker Thread| Pipeline[Middleware Pipeline]
-    Pipeline -->|Logger| Router[Router matches route]
-    Router -->|GET /files/| PathCheck{Path Check}
-    PathCheck -->|Invalid| Forbidden[403 Forbidden Response]
-    PathCheck -->|Valid| FileOps[File Operations GET/POST/DELETE]
-    
-    FileOps --> Response[HTTPResponse]
-    Forbidden --> Response
-    Router -->|GET /echo/| Response
-    
-    Response -->|Write Response bytes| SocketSend[Send response to Client]
+    EventLoop -->|non-blocking recv| BufferBytes[Buffer bytes into session]
+    BufferBytes --> HeaderCheck{Header boundary CRLFCRLF found?}
+    HeaderCheck -->|No, but over MAX_HEADER_BYTES| Reject400[400 Bad Request]
+    HeaderCheck -->|Not yet, under limit| EventLoop
+    HeaderCheck -->|Found| ChunkedCheck{Transfer-Encoding chunked?}
+
+    ChunkedCheck -->|Yes| Reject501[501 Not Implemented]
+    ChunkedCheck -->|No| SizeCheck{Content-Length over MAX_BODY_BYTES?}
+    SizeCheck -->|Yes| Reject413[413 Payload Too Large]
+    SizeCheck -->|No| BodyWait{Full body buffered yet?}
+    BodyWait -->|Not yet| EventLoop
+    BodyWait -->|Yes| Dispatch["Unregister socket (queued),<br/>dispatch to Thread Pool"]
+
+    subgraph ThreadPoolWorker["Thread Pool Worker"]
+    Dispatch --> ParseCheck{Request line parses?}
+    ParseCheck -->|No| Reject400b[400 Bad Request]
+    ParseCheck -->|Yes| Pipeline["Middleware Pipeline:<br/>Logger -> StaticFiles"]
+    Pipeline --> RouteMatch{Router match on method+path?}
+    RouteMatch -->|Handler found| Handler[Route Handler]
+    RouteMatch -->|Path exists, wrong method| Reject405["405 + Allow header"]
+    RouteMatch -->|No route at all| Reject404[404 Not Found]
+
+    Handler --> TraversalCheck{"/files/ request:<br/>resolves outside sandbox?"}
+    TraversalCheck -->|Yes| Reject403[403 Forbidden]
+    TraversalCheck -->|No, large file GET| StreamFile["Stream file,<br/>64KB chunks"]
+    TraversalCheck -->|No, small/dynamic| BufferBody["Buffer body,<br/>optional gzip"]
+
+    StreamFile --> SendResponse["Send response<br/>(socket set blocking for this write)"]
+    BufferBody --> SendResponse
+    Reject405 --> SendResponse
+    Reject404 --> SendResponse
+    Reject403 --> SendResponse
     end
-    
-    SocketSend -->|Keep-Alive Check| EventLoop
+
+    SendResponse -->|Keep-Alive| Requeue["Queue register(conn) action"]
+    Requeue --> EventLoop
+    SendResponse -->|Connection close| CloseConn[Close connection]
+```
+
+### Selector & Lock Ownership
+
+```mermaid
+graph TD
+    subgraph EventLoopThread["Event Loop Thread - the only thread touching the selector"]
+    SelectCall["selector.select(timeout=0.5)"] --> DispatchEvents[Dispatch ready callbacks]
+    DispatchEvents --> DrainQueue["Drain selector action queue<br/>(apply queued register/unregister)"]
+    DrainQueue --> SweepIdle["Sweep idle connections<br/>(close if silent &gt; IDLE_TIMEOUT_SECONDS)"]
+    SweepIdle --> SelectCall
+    end
+
+    subgraph WorkerThreads["ThreadPoolExecutor Worker Threads"]
+    Worker["_process_request /<br/>_check_buffered_request"] -->|"post register/unregister"| ActionQueue[("Selector Action Queue")]
+    end
+
+    ActionQueue --> DrainQueue
+
+    subgraph LockingModel["Locking Model"]
+    SessionsLock["sessions_lock:<br/>dict insert/remove only"]
+    PerConnLock["session['lock']:<br/>per-connection buffer state"]
+    end
 ```
 
 ### Concurrency Design
-* **Event Loop Thread**: Monitors active connections, reads incoming bytes into session buffers, and detects request boundaries (`\r\n\r\n` + `Content-Length`).
-* **Task Queue**: Once a request is fully assembled, the event loop unregisters the client socket and hands the task off to the Thread Pool.
-* **Connection Re-registration**: After writing the response, the worker thread checks the keep-alive status. If persistent, it registers the socket back to the event loop.
+* **Event Loop Thread**: Monitors active connections, reads incoming bytes into per-connection session buffers, and detects request boundaries (`\r\n\r\n` + `Content-Length`). It is the *only* thread that ever calls `selector.register()`/`unregister()`/`select()`.
+* **Selector Action Queue**: Worker threads that need to change a socket's read-interest (re-registering after a keep-alive response, unregistering before dispatch) post an action to a `queue.Queue` instead of touching the selector themselves; the event-loop thread drains it once per tick, right after processing events and before the next `select()` call.
+* **Per-Connection Locking**: Buffer/parse state lives inside each connection's session dict, guarded by that session's own lock - so two different clients' requests are never serialized behind one global mutex. A separate `sessions_lock` only protects inserting/removing entries from the connection table itself.
+* **Idle Sweep**: Once per event-loop tick, any connection silent for longer than `IDLE_TIMEOUT_SECONDS` (default 30s) is closed - covers both a stalled mid-request client and a keep-alive connection nobody's using anymore.
+* **Connection Re-registration**: After writing the response, the worker thread checks the keep-alive status. If persistent, it queues a re-registration action instead of registering directly.
+* **Blocking-for-the-Write**: `conn` is normally non-blocking (owned by the event loop), but a worker thread temporarily flips it to blocking for the duration of sending a response - large/streamed bodies sent across many `sendall()` calls can otherwise overflow the OS send buffer and raise `BlockingIOError` mid-response instead of waiting.
 
 ---
 
@@ -64,7 +132,9 @@ graph TD
 * **Modular Architecture**: Restructured from a monolith into clean, single-responsibility modules.
 * **Separation of Concerns**: Disconnected request/response formatting, router matching, and socket loop layers.
 * **Extensible Middleware**: Clean interfaces allowing third-party extensions to wrap route execution.
-* **Thread Safety**: State maps and selector registrations synchronized via thread lock primitives.
+* **Thread Safety**: Per-connection state and all selector mutation are synchronized through a single-writer model rather than one global lock, so unrelated connections don't contend with each other.
+* **Resilience**: A single bad connection, oversized request, or unsupported encoding degrades to a clean error response, not a crashed server or a hung shutdown.
+* **Verifiability**: Every fix above shipped with a regression test - including one that starts a real server on a real socket to prove `stop()` no longer deadlocks.
 
 ---
 
@@ -72,25 +142,29 @@ graph TD
 
 ```
 custom-http-server/
+ ├── .github/
+ │    └── workflows/
+ │         └── tests.yml        # CI: runs pytest on push/PR
  ├── app/
  │    ├── core/
  │    │    ├── request.py       # HTTPRequest parsing
- │    │    ├── response.py      # HTTPResponse serialization
- │    │    └── server.py        # Selector loop and ThreadPool manager
+ │    │    ├── response.py      # HTTPResponse serialization & streaming
+ │    │    └── server.py        # Selector loop, ThreadPool, and concurrency safety
  │    ├── middleware/
  │    │    ├── base.py          # Middleware pipeline engine
- │    │    ├── logger.py        # Format console logging
+ │    │    ├── logger.py        # Structured access/crash logging
  │    │    └── static.py        # Static file actions & path defenses
  │    ├── routing/
- │    │    └── router.py        # Path parameter match routing
- │    └── main.py               # Framework setup and routes register
- ├── docs/
- │    ├── adr_architecture.md   # Architectural Decision Record
- │    ├── definitions.md        # Technical definitions guide
- │    └── interview_defense.md  # System design prep defense
+ │    │    └── router.py        # Path parameter match routing + 405 support
+ │    └── main.py                # Framework setup and routes register
+ ├── tests/                      # pytest suite (unit + real-socket integration)
+ ├── pytest.ini
  ├── Dockerfile
  └── Docker-compose.yaml
 ```
+
+> `docs/` and `FEATURES.md` are local, gitignored notes (interview prep, architecture
+> scratch notes) and are not part of this repo's tracked contents.
 
 ---
 
@@ -107,6 +181,11 @@ PYTHONPATH=. python3 app/main.py --directory ./sandbox
 Or start the containerized service:
 ```bash
 docker-compose up --build
+```
+
+### Running Tests
+```bash
+python3 -m pytest -v
 ```
 
 ---
@@ -195,12 +274,21 @@ curl -v -X POST http://localhost:4221/files/hello.txt -d "Written through custom
 curl -v http://localhost:4221/files/hello.txt
 curl -v -X DELETE http://localhost:4221/files/hello.txt
 
-# 5. Directory Traversal test
+# 5. Directory Traversal test (expect 403)
 curl -v --path-as-is http://localhost:4221/files/../../../../etc/passwd
+
+# 6. Wrong method on a registered path (expect 405 + Allow header)
+curl -v -X POST http://localhost:4221/echo/hi
+
+# 7. Chunked request body (expect 501, not a silently corrupted pipeline)
+curl -v -X POST http://localhost:4221/files/x -H "Transfer-Encoding: chunked" -d "streamed"
+
+# 8. Oversized request body (expect 413)
+curl -v -X POST http://localhost:4221/files/x -H "Content-Length: 999999999999"
 ```
 
 ---
 
 ## License
 
-This project is licensed under the MIT License - see the [LICENSE](file:///Users/akshatkankani/Desktop/Github/custom-http-server/LICENSE) file for details.
+This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.

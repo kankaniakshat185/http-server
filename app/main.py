@@ -1,3 +1,4 @@
+import logging
 import sys
 from app.core.server import HTTPServer
 from app.core.request import HTTPRequest
@@ -26,10 +27,13 @@ def handle_user_agent(request: HTTPRequest) -> HTTPResponse:
     )
 
 def main():
-    directory = ""
-    if len(sys.argv) >= 3 and sys.argv[1] == "--directory":
-        directory = sys.argv[2]
-        
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s - %(message)s")
+
+    if len(sys.argv) < 3 or sys.argv[1] != "--directory":
+        print("Usage: python3 app/main.py --directory <path>", file=sys.stderr)
+        sys.exit(1)
+    directory = sys.argv[2]
+
     # Instantiate core HTTP Server
     server = HTTPServer(host="0.0.0.0", port=4221, max_workers=8)
     

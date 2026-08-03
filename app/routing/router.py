@@ -31,6 +31,21 @@ class Router:
                 return handler, params
         return None, {}
 
+    def allowed_methods(self, path: str) -> list:
+        """
+        Returns every HTTP method that has a route registered for this path,
+        regardless of which method actually matched. Used to distinguish a
+        genuine 404 (no route at all) from a 405 (route exists, wrong verb).
+        """
+        methods = []
+        for method, entries in self.routes.items():
+            for pattern, _ in entries:
+                matched, _ = self._match_path(pattern, path)
+                if matched:
+                    methods.append(method)
+                    break
+        return methods
+
     def _match_path(self, pattern: str, path: str) -> tuple[bool, dict]:
         """
         Splits and matches route parts. Resolves variables starting with ':'.
