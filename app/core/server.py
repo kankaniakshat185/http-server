@@ -44,6 +44,14 @@ class HTTPServer:
         # unregister() directly - they post a request here, and only the
         # event-loop thread (inside start()) drains it and touches the selector.
         self._selector_actions = queue.Queue()
+        # A queued selector action otherwise sits unapplied until select()'s
+        # next scheduled wakeup - fine under load (something else wakes it
+        # constantly), but with one low-frequency client that's dead time up
+        # to the full poll timeout on every request. This socketpair lets a
+        # worker thread nudge a blocked select() to return immediately.
+        self._wakeup_reader, self._wakeup_writer = socket.socketpair()
+        self._wakeup_reader.setblocking(False)
+        self._wakeup_writer.setblocking(False)
         self.running = False
         self.server_socket = None
 
@@ -54,6 +62,7 @@ class HTTPServer:
         self.server_socket = socket.create_server((self.host, self.port), reuse_port=True)
         self.server_socket.setblocking(False)
         self.selector.register(self.server_socket, selectors.EVENT_READ, self._accept)
+        self.selector.register(self._wakeup_reader, selectors.EVENT_READ, self._drain_wakeup)
 
         self.running = True
         logger.info("Server started on http://%s:%s using hybrid Async + Thread Pool concurrency model...", self.host, self.port)
@@ -91,6 +100,12 @@ class HTTPServer:
                 except KeyError:
                     pass
                 self.server_socket.close()
+            try:
+                self.selector.unregister(self._wakeup_reader)
+            except KeyError:
+                pass
+        self._wakeup_reader.close()
+        self._wakeup_writer.close()
         self.selector.close()
         self.thread_pool.shutdown(wait=False)
 
@@ -115,6 +130,21 @@ class HTTPServer:
                     self.selector.unregister(conn)
             except (KeyError, ValueError, OSError):
                 pass
+
+    def _drain_wakeup(self, sock, mask):
+        """Callback for the wakeup socketpair - draining it is the entire point of the read."""
+        try:
+            while sock.recv(4096):
+                pass
+        except (BlockingIOError, OSError):
+            pass
+
+    def _wake_event_loop(self):
+        """Nudges a blocked select() call to return now instead of waiting out its timeout."""
+        try:
+            self._wakeup_writer.send(b"x")
+        except (BlockingIOError, OSError):
+            pass
 
     def _sweep_idle_connections(self):
         """
@@ -254,6 +284,7 @@ class HTTPServer:
                 # Re-register for reading future pipelined requests. The actual
                 # selector call happens on the event-loop thread, never here.
                 self._selector_actions.put(("register", conn))
+                self._wake_event_loop()
                 self._check_buffered_request(conn)
 
         except Exception:
@@ -334,6 +365,7 @@ class HTTPServer:
 
             # Temporarily drop read interest while the thread pool processes this
             self._selector_actions.put(("unregister", conn))
+            self._wake_event_loop()
             self.thread_pool.submit(self._process_request, conn, addr, headers_to_process, body)
 
         return True
@@ -375,6 +407,7 @@ class HTTPServer:
         if conn in self.sessions:
             del self.sessions[conn]
             self._selector_actions.put(("unregister", conn))
+            self._wake_event_loop()
             try:
                 conn.close()
             except Exception:

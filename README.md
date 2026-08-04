@@ -2,6 +2,8 @@
 
 A modular, high-performance HTTP/1.1 server and lightweight framework built from scratch in Python. It uses an event-driven networking architecture with non-blocking I/O (`selectors`), a task-dispatching worker thread pool, Express-style middleware, dynamic path variable routing, and persistent HTTP/1.1 connections - hardened with request-size limits, idle-connection timeouts, and a single-writer selector model, and backed by a 33-test pytest suite running in CI.
 
+Full write-up of the architecture and the concurrency bugs a self-audit found: [Behind the Sockets: What I Learned Building a Python HTTP Server](https://akshatkankani.vercel.app/tech-blog/custom-http-server)
+
 ---
 
 ## Core Features
@@ -40,9 +42,9 @@ A modular, high-performance HTTP/1.1 server and lightweight framework built from
 * **~14.5% lower** average latency.
 * **~33% lower** tail latency.
 
-> These benchmark numbers were captured before the hardening pass above. The added
-> per-request size/encoding checks and idle-connection sweep are O(1)/cheap per
-> request and per event-loop tick respectively, but haven't been re-benchmarked yet.
+> These RPS-vs-Flask numbers were captured before the hardening pass above and
+> haven't been re-run. See "Concurrency Benchmarks: Before vs. After the Fixes"
+> below for numbers that were actually re-measured against both versions.
 
 ---
 
@@ -254,6 +256,75 @@ The following metrics were gathered locally on a MacBook Air:
 * **Low Overhead Routing**: We omit heavy routing engines, application context loaders, and request/response abstraction layers found in general-purpose frameworks like Flask.
 
 *Note: Flask is a feature-rich, general-purpose framework. This benchmark measures a raw throughput workload under a specific concurrency level; the results demonstrate the efficiency of our low-level hybrid networking model rather than suggesting this server is broadly "better" than Flask.*
+
+---
+
+## Concurrency Benchmarks: Before vs. After the Fixes
+
+The RPS-vs-Flask table above is a single-connection serial `ab` run against `/` -
+it wouldn't have caught the shutdown deadlock or the selector race, because
+neither bug depends on raw throughput, they depend on *concurrent open
+connections*. So instead of re-running `ab`, the concurrency fixes were
+benchmarked directly: the exact pre-audit `server.py` (reconstructed from the
+original commit) was run side-by-side against the current one, hitting both
+with real sockets - not mocks - at several concurrency levels.
+
+### Shutdown latency
+
+Each row opens N real Keep-Alive connections, then triggers shutdown and
+measures how long it takes to complete (capped at a 3s timeout to detect a hang):
+
+| Open connections at shutdown | Before | After |
+| :--- | :--- | :--- |
+| 0 | completes, 0.49s | completes, 0.49s |
+| 1 | **hangs (3.00s timeout)** | completes, 0.50s |
+| 10 | **hangs (3.00s timeout)** | completes, 0.50s |
+| 50 | **hangs (3.00s timeout)** | completes, &lt;0.5s |
+
+The old code hung on every single run with at least one open connection - not
+occasionally, every time, which is exactly what you'd expect from a
+reentrant-lock bug rather than a timing-dependent race.
+
+### Throughput under real concurrent Keep-Alive load
+
+N client threads, each holding one persistent connection and firing `GET /`
+back-to-back for a fixed 2-second window, aggregate requests/sec across all of them:
+
+| Concurrent clients | Before | After |
+| :--- | :--- | :--- |
+| 1 | 21,759 rps | 12,141 rps |
+| 10 | 17,823 rps | 11,565 rps |
+| 50 | 17,941 rps | 14,188 rps |
+
+Worth being honest about: the fixed version is slower here, consistently.
+That's the real cost of the added per-request work (header/body size checks,
+chunked-encoding detection, idle-timeout bookkeeping, a per-connection lock
+acquisition) that the original version simply didn't do. None of it is
+optional if the size-limit and traversal fixes above are supposed to mean
+anything - but it isn't free, and pretending otherwise would defeat the point
+of actually measuring this.
+
+That table is also not the full story. Running it once already caught a real
+bug: at 1 concurrent client, the *first* fixed version - before the paragraph
+below - measured **2.5 rps**, not 12,141. Every request after the first one
+was taking a flat ~500ms. The selector-action-queue fix (bug two, in the
+[full write-up](https://akshatkankani.vercel.app/tech-blog/custom-http-server))
+is correct for the race condition, but a queued re-registration was sitting
+unapplied until the event loop's *next scheduled* `select()` wakeup - fine
+under load, since something else keeps waking the loop constantly, but with
+one low-frequency client there was often nothing else to trigger an early
+wakeup, so every request paid up to the full 0.5s poll timeout. The fix is a
+`socket.socketpair()` the event loop also watches: a worker thread queuing an
+action now writes one byte to it, which immediately unblocks a sleeping
+`select()` instead of waiting for it to time out. The 12,141 rps number above
+is with that fix in place - benchmarking the fix caught a regression the fix
+itself introduced, which is a large part of why this table exists at all
+instead of just an assertion that things got better.
+
+*Methodology: both variants run in-process via `threading.Thread`, driven by
+real `socket.create_connection` clients on `127.0.0.1` - no mocks, no `ab`.
+Numbers are from a single run each on the same machine as the RPS table above;
+treat them as directionally accurate, not lab-grade reproducible benchmarks.*
 
 ---
 
