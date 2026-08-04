@@ -1,35 +1,35 @@
 export const metadata = {
-  title: 'i built a custom http server in python to actually understand concurrency',
+  title: 'Behind the Sockets: What I Learned Building a Python HTTP Server',
   description:
-    'a raw-socket http/1.1 server in python - an event loop, a thread pool, and the four real concurrency bugs a self-audit found in code i thought was already correct.',
+    'a raw-socket http/1.1 server in python - the whole architecture, and the four real concurrency bugs a self-audit found in code i thought was already correct.',
   alternates: {
-    canonical: '/blog/custom-http-server-in-python',
+    canonical: '/tech-blog/custom-http-server',
   },
 };
 
-# i built a custom http server in python to actually understand concurrency
+# Behind the Sockets: What I Learned Building a Python HTTP Server
 
-so, this one's about a project i've had running for a while: a custom http/1.1 server, written from scratch in python. raw sockets, an event loop, a thread pool, routing, middleware - the whole thing, no `http.server`, no `asyncio`, no framework underneath it.
+so, this one's about a project i've had running for a while now: a custom http/1.1 server, written from scratch in python. raw sockets, an event loop, a thread pool, routing, middleware - the whole thing, no `http.server`, no `asyncio`, no framework hiding underneath it doing the actual work.
 
-the interesting part isn't that it works though. it's what happened when i stopped treating "it works" as the same thing as "it's correct," and audited my own code like it belonged to someone else. i found four real concurrency bugs. one of them meant the server would hang forever on shutdown, basically every single time. this is that story, plus everything you need to actually follow it.
+i want to walk through the whole thing here, not just the interesting parts, because honestly the boring parts (header parsing, routing, gzip) are where you learn just as much as the async stuff. but i'll admit the *really* interesting part is the second half - what happened when i stopped treating "it works" as the same thing as "it's correct," and audited my own code like it belonged to someone else. i found four real concurrency bugs. one of them meant the server would hang forever on shutdown, basically every single time i ran it. we'll get there.
 
-the github repo: https://github.com/kankaniakshat185/custom-http-server
+grab a coffee, this is a long one.
 
 ---
 
 ## why build an http server from scratch
 
-you can `pip install flask` in four seconds and never think about a socket again. so why not do that.
+you can `pip install flask` in four seconds and never think about a socket again. so why not just do that?
 
-because "http server" is one of those things everyone uses and almost nobody has actually looked inside. the moment you build one yourself, a pile of things you've been taking on faith stop being magic: what keep-alive actually is, why a raw TCP stream doesn't come with request boundaries built in, why `Content-Length` exists, what a thread pool is actually buying you under Python's GIL. you can read about all of that. you don't *understand* it until you've had to write the code that draws the line between "this is one request" and "this is the start of the next one."
+because "http server" is one of those things everyone uses and almost nobody has actually looked inside of. the moment you build one yourself, a whole pile of things you've been taking on faith stop being magic: what keep-alive actually is, why a raw TCP stream doesn't come with request boundaries built in, why `Content-Length` exists at all, what a thread pool is actually buying you under python's GIL. you can read about all of that in a blog post (like this one, i guess). but you don't really *understand* it until you've had to write the code that draws the line between "this is one request" and "this is the start of the next one" - byte by byte, off a socket that doesn't care how you feel about it.
 
-that line, it turns out, is also exactly where most of the interesting bugs live.
+that line, it turns out, is also exactly where most of the interesting bugs live. more on that later.
 
 ---
 
 ## the event loop
 
-the server runs a single event loop thread on top of `selectors.DefaultSelector`, which wraps `epoll` on linux and `kqueue` on macOS/BSD. every socket is non-blocking. the loop doesn't read anything itself - it just asks the kernel "which of these sockets have something ready," and only touches the ones that do.
+the server runs a single event loop thread on top of `selectors.DefaultSelector`, which wraps `epoll` on linux and `kqueue` on macOS/BSD depending on where it's running. every socket is non-blocking. the loop itself doesn't really *read* anything - it just asks the kernel "which of these sockets have something ready for me," and only bothers touching the ones that do.
 
 ```python
 def start(self):
@@ -47,7 +47,7 @@ def start(self):
         self._sweep_idle_connections()
 ```
 
-a new connection gets a session: a buffer, a per-connection lock, a timestamp. every time data arrives, it goes through `_read`, which appends bytes to the buffer and checks for the `\r\n\r\n` that separates headers from body. once `Content-Length` is known and enough bytes have arrived, the request is complete - and at that point the socket gets unregistered and the actual work gets handed off.
+a new connection gets a session dict: a buffer, a per-connection lock, a timestamp. every time bytes arrive on that socket, they go through `_read`, which appends them to the buffer and checks for the `\r\n\r\n` that separates headers from body. once `Content-Length` is known and enough bytes have actually arrived, the request is complete, and at that point the socket gets pulled off the loop and the real work gets handed off elsewhere.
 
 ```python
 def _read(self, conn, mask):
@@ -64,33 +64,271 @@ def _read(self, conn, mask):
         self._dispatch_if_complete(conn, session)
 ```
 
-none of this blocks. a slow client sending one byte every few seconds doesn't tie up anything - the event loop just doesn't get called for that socket until more data shows up. that's the entire point of the design.
+none of this blocks, anywhere. a slow client sending one byte every few seconds doesn't tie anything up - the event loop just doesn't get called for that socket again until more data actually shows up. that's really the whole point of the design, and it's a nice thing to internalize: the loop isn't "waiting" on anyone, it's just responding to whoever's ready.
 
 ---
 
-## offloading to a thread pool (and the gil question everyone asks)
+## turning bytes into a request object
 
-reading bytes off a socket is cheap and non-blocking. running a route handler, or reading/writing a file from disk, is not - and Python has no non-blocking filesystem API. so once a full request is assembled, it gets handed to a `ThreadPoolExecutor`:
+by the time `_process_request` runs, we've got two blobs of bytes: the header block, and the body. neither means anything yet. `HTTPRequest.parse` is what turns that into something a route handler can actually work with.
 
 ```python
-self.thread_pool.submit(self._process_request, conn, addr, headers_to_process, body)
+@classmethod
+def parse(cls, headers_part: bytes, body_part: bytes) -> 'HTTPRequest':
+    headers_decoded = headers_part.decode("utf-8", errors="ignore")
+    lines = headers_decoded.split("\r\n")
+
+    if not lines or not lines[0]:
+        raise ValueError("Empty request line")
+
+    request_line = lines[0]
+    parts = request_line.split(" ")
+    if len(parts) < 3:
+        raise ValueError("Malformed HTTP request line")
+
+    method, full_path, version = parts[0], parts[1], parts[2]
+
+    path = full_path
+    query_params = {}
+    if "?" in full_path:
+        path, query_string = full_path.split("?", 1)
+        for param in query_string.split("&"):
+            if "=" in param:
+                k, v = param.split("=", 1)
+                query_params[k] = v
+            elif param:
+                query_params[param] = ""
+
+    headers = {}
+    for line in lines[1:]:
+        if ":" in line:
+            key, val = line.split(":", 1)
+            headers[key.strip().lower()] = val.strip()
+
+    return cls(method=method, path=path, headers=headers, body=body_part,
+               query_params=query_params, version=version)
 ```
 
-this is the part that gets a GIL question in every interview, so let's just answer it here: yes, the Global Interpreter Lock means only one thread executes Python bytecode at a time. it doesn't matter for this server, because the server is I/O-bound, not CPU-bound. when a worker thread calls `conn.sendall()` or `open(path).read()`, the interpreter releases the GIL for the duration of that system call. so while one thread is blocked in a disk read, another can run Python code, and a third can be blocked on its own socket write. the GIL only becomes a real ceiling if you're doing CPU-bound work across threads - image processing, parsing, hashing - at which point you'd reach for a `ProcessPoolExecutor` instead. this server never does that kind of work, so a thread pool is exactly the right tool.
+a couple of small decisions in there matter more than they look. headers get lowercased on the way in, which is the whole trick behind case-insensitive lookups later - `request.get_header("Content-Type")` and `request.get_header("content-type")` end up hitting the same dict key, because we never store the client's original casing. and the request line only needs three space-separated tokens to be considered *parseable* - it doesn't validate that the method is a real HTTP method, or that the path looks like a path. that's on purpose, mostly: this layer's job is framing, not validation. if the request line genuinely doesn't have three parts, that's the one thing it does refuse outright, by raising instead of limping along with `None`s.
 
-with the happy path built - event loop, thread pool, routing, a middleware pipeline, gzip, keep-alive, path traversal defense - the server worked. curl against it, everything came back correct. i called it done.
+---
 
-then i decided to find out if that was true.
+## routing without a framework
+
+routing here is deliberately dumb, in a good way. no regex compiler, no route trees, just a list of `(pattern, handler)` pairs per method, checked in order.
+
+```python
+def match(self, method: str, path: str):
+    method = method.upper()
+    if method not in self.routes:
+        return None, {}
+    for pattern, handler in self.routes[method]:
+        matched, params = self._match_path(pattern, path)
+        if matched:
+            return handler, params
+    return None, {}
+
+def _match_path(self, pattern: str, path: str):
+    pattern_parts = [p for p in pattern.split("/") if p]
+    path_parts = [p for p in path.split("/") if p]
+    if len(pattern_parts) != len(path_parts):
+        return False, {}
+
+    params = {}
+    for p_part, r_part in zip(pattern_parts, path_parts):
+        if p_part.startswith(":"):
+            params[p_part[1:]] = r_part
+        elif p_part != r_part:
+            return False, {}
+    return True, params
+```
+
+split both the pattern and the actual path on `/`, drop the empty segments (which quietly handles trailing slashes for free), and walk them together. a segment starting with `:` is a capture, anything else has to match literally. `/echo/:string` against `/echo/hello` gives you `{"string": "hello"}`. that's the entire routing engine. it's O(n) per lookup and doesn't care, because nobody's registering ten thousand routes on a toy server.
+
+one thing that *wasn't* in the original version, though: `match()` only ever tells you "yes, exactly this method and path" or "no." it can't tell you "the path exists, you just used the wrong verb" - so a `POST` to a `GET`-only route and a `POST` to a path that doesn't exist at all looked identical, both a flat `404`. that's a real correctness gap - a `404` should mean "nothing's here," a `405` should mean "something's here, wrong verb" - so `allowed_methods()` exists specifically to answer that second question, walking every registered method's patterns against the path independent of what the actual request used:
+
+```python
+def allowed_methods(self, path: str) -> list:
+    methods = []
+    for method, entries in self.routes.items():
+        for pattern, _ in entries:
+            matched, _ = self._match_path(pattern, path)
+            if matched:
+                methods.append(method)
+                break
+    return methods
+```
+
+the dispatch logic tries an exact match first, and only falls back to `allowed_methods()` - and a `405` with a populated `Allow` header - if that fails and something else on the path did match.
+
+---
+
+## middleware, onion-style
+
+the middleware system is the one part of this codebase i'd call genuinely elegant, and it's also the shortest file in the project by a mile:
+
+```python
+class MiddlewarePipeline:
+    def __init__(self):
+        self.middlewares = []
+
+    def use(self, middleware_func):
+        self.middlewares.append(middleware_func)
+
+    def execute(self, request, final_handler):
+        def dispatch(index):
+            if index < len(self.middlewares):
+                middleware = self.middlewares[index]
+                return middleware(request, lambda req: dispatch(index + 1))
+            return final_handler(request)
+        return dispatch(0)
+```
+
+that's the entire chain-of-responsibility pattern in twelve lines. every middleware is just a function (or a callable object, either works) shaped like `(request, next_handler) -> HTTPResponse`. call `next_handler(request)` and control passes to whoever's next in line; don't call it, and the chain stops right there - which is exactly what you want for something like auth middleware that short-circuits on a bad token, even though this project doesn't have auth. `logger_middleware` is the plainest example: it calls `next_handler(request)`, catches whatever comes back (or whatever exception blows up), and logs either way.
+
+```python
+def logger_middleware(request, next_handler) -> HTTPResponse:
+    try:
+        response = next_handler(request)
+    except Exception:
+        logger.exception("...")
+        response = HTTPResponse(status=500, body=b"Internal Server Error")
+
+    logger.info("... -> %s", response.status)
+    return response
+```
+
+which, by the way, is also the server's only safety net for a route handler throwing an unhandled exception - without this middleware in the pipeline, a bug in your own route code would take the whole connection down instead of degrading to a clean `500`.
+
+---
+
+## keep-alive, and the part everyone forgets about
+
+HTTP/1.1 defaults to persistent connections - the client doesn't reopen a TCP connection for every request, it just sends another one down the same pipe once the last response finishes. which sounds simple until you actually have to implement the "once the last response finishes" part, because a single `recv()` call has zero concept of where one request ends and the next begins. if a client pipelines two requests back to back in the same TCP segment, you might read *both* of them in one `conn.recv(4096)` call.
+
+that's what the `leftover` handling in `_dispatch_if_complete` is for - once a full request's been sliced off the front of the buffer, whatever's left over stays in the session instead of getting thrown away:
+
+```python
+body = session["body_part"][:session["content_length"]]
+leftover = session["body_part"][session["content_length"]:]
+...
+session["buffer"] = leftover
+```
+
+and after the worker thread sends a response, if the connection is meant to stay open, that leftover buffer gets checked immediately (`_check_buffered_request`) in case a second pipelined request is already sitting there waiting, instead of going back to the event loop and waiting for a `recv()` event that might never come because there's nothing left to receive - the bytes already arrived, they're just sitting in memory.
+
+whether a connection stays open at all comes down to one line:
+
+```python
+is_keep_alive = (request.version == "HTTP/1.1" and conn_header != "close") or (conn_header == "keep-alive")
+```
+
+HTTP/1.1 without an explicit `Connection: close` stays open. HTTP/1.0 stays closed unless the client explicitly asks for `keep-alive`. small line, but it's the difference between every request paying for a fresh TCP handshake and most of them not having to.
+
+---
+
+## gzip, mime types, and the unglamorous middle
+
+nobody writes a blog post about content negotiation because it's not exciting, but it's the kind of thing that's invisible when it works and confusing when it doesn't, so here it is anyway.
+
+when a route handler or the static file middleware returns a response, `HTTPResponse.to_bytes()` checks whether the client sent `Accept-Encoding: gzip` and, if so, compresses the body before it goes on the wire:
+
+```python
+if client_supports_gzip and self._should_compress(resp_headers, len(response_body)):
+    response_body = gzip.compress(response_body)
+    resp_headers["content-encoding"] = "gzip"
+```
+
+the `_should_compress` check is the part that actually matters, though. compressing an already-compressed file - a jpeg, a zip, a video - burns CPU for basically nothing, and can occasionally make the output *bigger*. so it's skipped by content-type:
+
+```python
+def _should_compress(self, resp_headers, body_len):
+    if body_len == 0 or "content-encoding" in resp_headers:
+        return False
+    content_type = resp_headers.get("content-type", "").split(";", 1)[0].strip().lower()
+    if content_type.startswith(self._NON_COMPRESSIBLE_PREFIXES):
+        return False
+    return content_type not in self._NON_COMPRESSIBLE_TYPES
+```
+
+and the content-type itself, for files served off disk, comes from python's own `mimetypes` module rather than anything custom - `mimetypes.guess_type(filepath)` looks at the extension and hands back something reasonable, falling back to `application/octet-stream` when it has no idea what it's looking at. not glamorous. correct, though, which is the actual bar.
+
+---
+
+## serving files without blowing up memory
+
+the static file middleware handles `GET`/`POST`/`DELETE` under `/files/`, and for a long time the `GET` path did the obvious, naive thing: open the file, `f.read()` the whole thing, send it. fine for a text file. genuinely bad for a video.
+
+the fix was to branch on size. small files still get read fully into memory - simple, and it lets them stay gzip-eligible, since compressing needs the whole body up front anyway to know the final `Content-Length`. anything bigger gets a `stream_path` instead of a `body`:
+
+```python
+if os.path.getsize(filepath) > self.STREAM_THRESHOLD_BYTES:
+    return HTTPResponse(status=200, headers={"Content-Type": mime_type}, stream_path=filepath)
+
+with open(filepath, "rb") as f:
+    response_body = f.read()
+return HTTPResponse(status=200, headers={"Content-Type": mime_type}, body=response_body)
+```
+
+and `HTTPResponse.write_to()` is what actually knows what to do with a `stream_path`: figure out the size up front with `os.path.getsize` (so `Content-Length` is correct before a single body byte goes out), send the headers, then read and write the file in fixed 64KB chunks instead of one giant blob.
+
+```python
+with open(self.stream_path, "rb") as f:
+    while True:
+        chunk = f.read(self.STREAM_CHUNK_BYTES)
+        if not chunk:
+            break
+        conn.sendall(chunk)
+```
+
+memory usage for a response is now bounded by the chunk size, not the file size. a 10GB file and a 10KB file cost the same amount of RAM to send. (this is also where bug three below comes from, so keep this section in mind.)
+
+---
+
+## shipping it
+
+none of this is worth much if it only runs on my laptop, so it's containerized - a `python:3.13-slim` base, the `app/` package copied in, and the entry point pointed at a `/data` volume for wherever files get uploaded:
+
+```dockerfile
+FROM python:3.13-slim
+WORKDIR /workspace
+COPY app/ ./app/
+EXPOSE 4221
+ENV PYTHONPATH=/workspace
+CMD ["python3", "-u", "app/main.py", "--directory", "/data"]
+```
+
+and compose just wires up the port and a bind mount so uploaded files land on the actual host filesystem instead of vanishing the moment the container gets torn down:
+
+```yaml
+services:
+  web:
+    build: .
+    ports:
+      - "4221:4221"
+    volumes:
+      - ./sandbox:/data
+```
+
+`python3 -u` matters more than it looks like it should - without unbuffered output, logs sit in an internal buffer and never show up in `docker-compose logs` until the buffer fills or the process exits, which makes debugging a running container feel like shouting into a void.
+
+---
+
+with all of that built - event loop, parsing, routing, middleware, keep-alive, gzip, streaming, a container to ship it in - the server *worked*. curl against it, everything came back correct. every endpoint did what it said it would.
+
+so i called it done. which, in hindsight, was the mistake.
 
 ---
 
 ## then i audited my own code
 
-i went through it the way i'd want a staff engineer to review a pull request of mine: not "does the demo work," but "what happens under conditions i didn't happen to test." four real bugs came out of that, and every one of them lived specifically in the concurrency layer - the exact part of the codebase i was proudest of.
+i went through the whole thing the way i'd want a staff engineer to review a pull request of mine - not "does the demo work," but "what happens under conditions i didn't happen to test." four real bugs came out of that. and every single one of them lived in the concurrency layer - the exact part of the codebase i was proudest of, the part i'd spent the most time getting "right."
+
+that's not a coincidence, and i'll come back to why at the end.
 
 ### bug one: the lock that ate its own tail
 
-here's the original shutdown code:
+here's the original shutdown code, before i touched it:
 
 ```python
 def stop(self):
@@ -112,11 +350,11 @@ def _close_connection(self, conn):
             conn.close()
 ```
 
-read `stop()` on its own: looks fine. read `_close_connection()` on its own: also looks fine. the bug only exists in the space between them - `stop()` acquires `self.lock`, then calls `_close_connection()`, which tries to acquire `self.lock` *again*. `threading.Lock` is not reentrant. the second acquire blocks forever, on a lock the very same thread already holds.
+read `stop()` on its own: looks fine. read `_close_connection()` on its own: also looks fine. the bug only exists in the *space between them* - `stop()` acquires `self.lock`, then calls `_close_connection()`, which tries to acquire the exact same lock again. `threading.Lock` is not reentrant. the second acquire just... blocks. forever. on a lock the very same thread already holds.
 
-in practice this meant: hit Ctrl+C while any connection was open - which, since HTTP/1.1 defaults to keep-alive, was essentially always - and the process would never exit. every graceful shutdown was actually a hang, silently, for the entire life of the project.
+in practice: hit Ctrl+C while any connection was open - which, since keep-alive is the HTTP/1.1 default, was essentially every time - and the process would never exit. every graceful shutdown i'd ever run was actually a silent hang, for the entire life of the project, and i had genuinely never noticed, because who sits there timing how long Ctrl+C takes.
 
-i didn't want to trust "i read the fix and it looks right" for a bug this specific, so i wrote a test that starts a real server on a real socket, opens a real keep-alive connection to it, and then asserts shutdown completes within a timeout:
+i didn't want to trust "i read the fix and it looks right" for a bug this specific. so i wrote a test that starts a real server on a real socket, opens a real keep-alive connection to it, and asserts shutdown actually completes within a timeout:
 
 ```python
 def test_shutdown_does_not_hang_with_open_keepalive_connection():
@@ -131,7 +369,7 @@ def test_shutdown_does_not_hang_with_open_keepalive_connection():
     assert not thread.is_alive(), "server.stop() hung - self-deadlock regression"
 ```
 
-on the old code, this test hangs until the timeout and fails. the fix was to stop the reentrancy at the source: split `_close_connection` into a public version that acquires the lock, and an internal `_close_connection_locked` that assumes the caller already holds it.
+on the old code, this hangs until the timeout and fails, which is exactly what i wanted to see once, on purpose, before trusting the fix. the fix itself is small: split `_close_connection` into a public version that acquires the lock, and an internal `_close_connection_locked` that assumes the caller already holds it.
 
 ```python
 def _close_connection(self, conn):
@@ -148,15 +386,15 @@ def _close_connection_locked(self, conn):
             pass
 ```
 
-`stop()` now calls the `_locked` variant directly. no re-entry, no hang.
+`stop()` calls the `_locked` variant directly now. no re-entry, no hang.
 
 ### bug two: racing the selector
 
-`selectors.DefaultSelector` isn't safe to mutate from one thread while `select()` is in progress on another. and that's exactly what was happening: the event loop's `select()` call ran unguarded on the main thread, while worker threads called `selector.register()`/`unregister()` directly, whenever a keep-alive connection needed to go back on the loop or a completed request needed to drop off it before dispatch.
+`selectors.DefaultSelector` isn't safe to mutate from one thread while `select()` is in progress on another - and that's exactly what was happening. the event loop's `select()` call ran unguarded on the main thread, while worker threads called `selector.register()` / `unregister()` directly, any time a keep-alive connection needed to go back on the loop, or a completed request needed to drop off it before dispatch.
 
-this isn't the kind of bug that gives you a clean, repeatable crash. it's the kind that shows up as an occasional `RuntimeError` or `KeyError` buried inside the standard library's `selectors` module, under real concurrent load, that you can't reproduce on demand.
+this isn't the kind of bug that gives you a clean, repeatable crash you can point at. it's the kind that shows up as an occasional `RuntimeError` or `KeyError` buried somewhere inside the standard library's `selectors` module, under real concurrent load, on a machine you're not sitting in front of, that you then can't reproduce on demand no matter how hard you try.
 
-the fix is a single-writer rule: worker threads never touch the selector. they post an action onto a queue instead, and only the event-loop thread ever calls `register()`/`unregister()`, draining that queue once per tick:
+the fix is a single-writer rule: worker threads don't touch the selector at all, ever. they post an action onto a queue instead, and only the event-loop thread ever calls `register()` / `unregister()`, draining that queue once per tick:
 
 ```python
 def _drain_selector_actions(self):
@@ -172,19 +410,19 @@ def _drain_selector_actions(self):
             self.selector.unregister(conn)
 ```
 
-a worker thread finishing a keep-alive response now does this instead of touching the selector itself:
+so a worker thread finishing a keep-alive response now does this, instead of touching the selector itself:
 
 ```python
 self._selector_actions.put(("register", conn))
 ```
 
-one thread owns the selector for its entire lifetime. the race just isn't representable anymore.
+one thread owns the selector for its entire life. the race isn't just fixed, it's not even representable in the code anymore - there's no code path left where a second thread *could* call `register()`.
 
 ### bug three: `sendall()` lied to me
 
-this one i found while adding a feature, not during the initial audit: streaming large static files in chunks instead of loading them fully into memory. i wrote the streaming loop, tested it against a 2MB file, and the download came back truncated. no exception on the client side - just fewer bytes than the file actually had.
+this one i actually found while adding the streaming feature above, not during the initial audit. i wrote the chunked read/write loop, tested it against a 2MB file, and the download came back truncated. no exception on the client side, curl just quietly handed me fewer bytes than the file actually had. that's a genuinely unsettling kind of bug to stare at.
 
-the server logs had the answer:
+the server logs had the answer, though:
 
 ```
 Traceback (most recent call last):
@@ -195,9 +433,9 @@ Traceback (most recent call last):
 BlockingIOError: [Errno 35] Resource temporarily unavailable
 ```
 
-every socket in this server is non-blocking, which is correct for the event loop. but worker threads were calling `conn.sendall()` on those same non-blocking sockets to send responses. a small response always fit in the OS send buffer in a single write, so this never came up. a 2MB file streamed across dozens of `sendall()` calls eventually filled that buffer mid-transfer - and a non-blocking socket doesn't wait for room, it raises `BlockingIOError` right there, aborting whatever was left of the response.
+every socket in this server is non-blocking, which is correct for the event loop's side of things. but worker threads were also calling `conn.sendall()` on those same non-blocking sockets, directly, to send responses. a small response always fit in the OS send buffer in one write, so this never surfaced - not once, in months of testing. a 2MB file streamed across dozens of `sendall()` calls, though, eventually fills that buffer mid-transfer, and a non-blocking socket doesn't politely wait for room to open up. it just raises `BlockingIOError` right there, aborting whatever was left of the response and leaving the client holding a truncated file.
 
-worker threads are allowed to block - that's the entire reason they're not the event loop thread. so the fix is to let them:
+worker threads are allowed to block, though - that's the entire reason they're not running on the event loop thread in the first place. so the fix is just to let them, for exactly as long as they need to:
 
 ```python
 def _send_response(self, conn, response, supports_gzip=False):
@@ -208,18 +446,18 @@ def _send_response(self, conn, response, supports_gzip=False):
         conn.setblocking(False)
 ```
 
-blocking for the duration of the write, then back to non-blocking before the socket goes back to the event loop. i confirmed it with a real 2MB and a real 10MB file, byte-for-byte, not a mocked socket - the kind of bug that only tells the truth over an actual wire.
+blocking mode for the duration of the write, then back to non-blocking before the socket goes back to the event loop for its next read. i confirmed it with a real 2MB file and then a real 10MB file, byte-for-byte, not a mocked socket - this felt like exactly the kind of bug that only tells you the truth over an actual wire, not in a unit test that fakes the network away.
 
 ### the traversal check that almost wasn't
 
-the server serves files under a sandboxed directory, and blocks anything that resolves outside it using `os.path.realpath()`. the original check:
+the server serves files under a sandboxed directory, and is supposed to block anything that resolves outside it, using `os.path.realpath()` to collapse away any `..` tricks. the original check:
 
 ```python
 if not resolved_filepath.startswith(self.directory):
     return HTTPResponse(status=403, ...)
 ```
 
-looks reasonable. it's also the textbook CWE-22 partial-path bug: if the sandbox is `/data`, a *sibling* directory `/data-evil` also satisfies `startswith("/data")`, because the string `"data-evil"` starts with `"data"`. a bare prefix check on strings isn't the same thing as a check on paths.
+looks reasonable at a glance. it's also the textbook CWE-22 partial-path bug. if the sandbox is `/data`, a *sibling* directory called `/data-evil` also satisfies `startswith("/data")` - because the string `"data-evil"` genuinely does start with `"data"`. a check on strings isn't the same thing as a check on paths, even though it's very easy to write code that quietly assumes it is.
 
 ```python
 if not (resolved_filepath == self.directory
@@ -227,23 +465,25 @@ if not (resolved_filepath == self.directory
     return HTTPResponse(status=403, ...)
 ```
 
-requiring the separator closes it. and because this is exactly the kind of bug that looks fine until you build the specific directory layout that breaks it, it gets a test that actually creates a sibling directory on disk and proves it's rejected, rather than trusting the diff by eye.
+requiring the trailing separator closes it. and because this is exactly the kind of bug that looks completely fine right up until you build the one specific directory layout that breaks it, it gets a test that actually creates a sibling directory on disk and proves it's rejected - rather than trusting the diff by eye, which is precisely how it got in there in the first place.
 
 ---
 
 ## what's still missing
 
-a "known limitations" list that never changes is worse than not having one - it just means nobody's checked it lately. so, honestly, as of today:
+a "known limitations" list that never gets updated is worse than not having one at all - it just means nobody's actually checked it lately. so, honestly, as of today:
 
-- **single event loop thread.** it's async, but it's one thread. scaling across cores means running multiple processes bound to the same port with `SO_REUSEPORT` - which the socket setup already supports, it's just not wired up as a supervisor yet.
-- **no chunked transfer-encoding.** a request with `Transfer-Encoding: chunked` gets a clean `501` instead of being silently mis-parsed, which is what used to happen - it would get treated as a zero-length body and corrupt the next pipelined request on that connection. that's a correctness fix, not support for the feature.
-- **the idle timeout resets on any activity.** stalled connections get closed after 30 seconds of silence, which bounds ordinary Slowloris-style resource exhaustion - but a client that paces bytes just under that window indefinitely can still hold a slot open. closing that needs an absolute deadline from connection-open, independent of activity resets.
-- **no TLS, no auth, no rate limiting.** in front of real traffic this sits behind a reverse proxy that handles all three. it was never trying to be that layer.
+- **single event loop thread.** it's async, but it's one thread. scaling across cores means running multiple processes bound to the same port with `SO_REUSEPORT` - which the socket setup already supports, it's just not wired up as an actual supervisor yet.
+- **no chunked transfer-encoding.** a request with `Transfer-Encoding: chunked` gets a clean `501` instead of being silently mis-parsed, which is what used to happen - it'd get treated as a zero-length body and quietly corrupt the next pipelined request on that connection. that's a correctness fix, to be clear, not support for the feature.
+- **the idle timeout resets on any activity.** stalled connections get closed after 30 seconds of silence, which bounds ordinary Slowloris-style resource exhaustion - but a client that paces bytes just under that window, indefinitely, can still hold a slot open forever. closing that properly needs an absolute deadline from connection-open, independent of activity resets, and that's not built yet.
+- **no TLS, no auth, no rate limiting.** in front of real traffic this would sit behind a reverse proxy that handles all three. it was never trying to be that layer, and i don't think it should be.
 
 ---
 
 ## the actual lesson
 
-none of these four bugs were in the parts of the codebase i was worried about. the routing was fine. the middleware pipeline was fine. gzip, keep-alive, path parsing - all fine on first pass. every single bug lived in the concurrency model: the one piece of this project that was genuinely hard to write, that i'd already spent the most time on, that i was most confident about.
+none of the four bugs above were in the parts of the codebase i was worried about. the routing was fine. the middleware pipeline was fine. gzip, keep-alive, path parsing, mime detection - all fine, first pass, no drama. every single bug lived in the concurrency model specifically: the one piece of this project that was genuinely hard to write, that i'd already spent the most time on, that i was the *most* confident about.
 
-that's sort of the whole point of auditing your own work instead of just shipping it once it runs. "it passed my manual testing" and "it's correct under concurrent load" are different claims, and the gap between them is exactly where a self-deadlock, a selector race, and a `BlockingIOError` were all quietly sitting, waiting for someone to actually go looking.
+and honestly, i think that's not a coincidence at all. the parts you sweat over are the parts you eventually stop questioning, because you remember how much thought went into them - and that memory of effort quietly gets mistaken for a guarantee of correctness. the parts that "just worked" on the first try get re-tested by accident, every time you touch something nearby. the parts you were proud of get left alone.
+
+that's really the whole argument for auditing your own work instead of just shipping it once it runs. "it passed my manual testing" and "it's correct under concurrent load" are different claims, and the gap between them is exactly where a self-deadlock, a selector race, and a `BlockingIOError` were all quietly sitting - waiting for someone to actually go looking, instead of just trusting that four months of it working meant it was right.
