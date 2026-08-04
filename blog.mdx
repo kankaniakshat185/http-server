@@ -1,0 +1,249 @@
+export const metadata = {
+  title: 'i built a custom http server in python to actually understand concurrency',
+  description:
+    'a raw-socket http/1.1 server in python - an event loop, a thread pool, and the four real concurrency bugs a self-audit found in code i thought was already correct.',
+  alternates: {
+    canonical: '/blog/custom-http-server-in-python',
+  },
+};
+
+# i built a custom http server in python to actually understand concurrency
+
+so, this one's about a project i've had running for a while: a custom http/1.1 server, written from scratch in python. raw sockets, an event loop, a thread pool, routing, middleware - the whole thing, no `http.server`, no `asyncio`, no framework underneath it.
+
+the interesting part isn't that it works though. it's what happened when i stopped treating "it works" as the same thing as "it's correct," and audited my own code like it belonged to someone else. i found four real concurrency bugs. one of them meant the server would hang forever on shutdown, basically every single time. this is that story, plus everything you need to actually follow it.
+
+the github repo: https://github.com/kankaniakshat185/custom-http-server
+
+---
+
+## why build an http server from scratch
+
+you can `pip install flask` in four seconds and never think about a socket again. so why not do that.
+
+because "http server" is one of those things everyone uses and almost nobody has actually looked inside. the moment you build one yourself, a pile of things you've been taking on faith stop being magic: what keep-alive actually is, why a raw TCP stream doesn't come with request boundaries built in, why `Content-Length` exists, what a thread pool is actually buying you under Python's GIL. you can read about all of that. you don't *understand* it until you've had to write the code that draws the line between "this is one request" and "this is the start of the next one."
+
+that line, it turns out, is also exactly where most of the interesting bugs live.
+
+---
+
+## the event loop
+
+the server runs a single event loop thread on top of `selectors.DefaultSelector`, which wraps `epoll` on linux and `kqueue` on macOS/BSD. every socket is non-blocking. the loop doesn't read anything itself - it just asks the kernel "which of these sockets have something ready," and only touches the ones that do.
+
+```python
+def start(self):
+    self.server_socket = socket.create_server((self.host, self.port), reuse_port=True)
+    self.server_socket.setblocking(False)
+    self.selector.register(self.server_socket, selectors.EVENT_READ, self._accept)
+
+    self.running = True
+    while self.running:
+        events = self.selector.select(timeout=0.5)
+        for key, mask in events:
+            callback = key.data
+            callback(key.fileobj, mask)
+        self._drain_selector_actions()
+        self._sweep_idle_connections()
+```
+
+a new connection gets a session: a buffer, a per-connection lock, a timestamp. every time data arrives, it goes through `_read`, which appends bytes to the buffer and checks for the `\r\n\r\n` that separates headers from body. once `Content-Length` is known and enough bytes have arrived, the request is complete - and at that point the socket gets unregistered and the actual work gets handed off.
+
+```python
+def _read(self, conn, mask):
+    session = self.sessions.get(conn)
+    chunk = conn.recv(4096)
+    if not chunk:
+        self._close_connection(conn)
+        return
+
+    with session["lock"]:
+        session["buffer"] += chunk
+        if not self._ensure_headers_parsed(conn, session):
+            return
+        self._dispatch_if_complete(conn, session)
+```
+
+none of this blocks. a slow client sending one byte every few seconds doesn't tie up anything - the event loop just doesn't get called for that socket until more data shows up. that's the entire point of the design.
+
+---
+
+## offloading to a thread pool (and the gil question everyone asks)
+
+reading bytes off a socket is cheap and non-blocking. running a route handler, or reading/writing a file from disk, is not - and Python has no non-blocking filesystem API. so once a full request is assembled, it gets handed to a `ThreadPoolExecutor`:
+
+```python
+self.thread_pool.submit(self._process_request, conn, addr, headers_to_process, body)
+```
+
+this is the part that gets a GIL question in every interview, so let's just answer it here: yes, the Global Interpreter Lock means only one thread executes Python bytecode at a time. it doesn't matter for this server, because the server is I/O-bound, not CPU-bound. when a worker thread calls `conn.sendall()` or `open(path).read()`, the interpreter releases the GIL for the duration of that system call. so while one thread is blocked in a disk read, another can run Python code, and a third can be blocked on its own socket write. the GIL only becomes a real ceiling if you're doing CPU-bound work across threads - image processing, parsing, hashing - at which point you'd reach for a `ProcessPoolExecutor` instead. this server never does that kind of work, so a thread pool is exactly the right tool.
+
+with the happy path built - event loop, thread pool, routing, a middleware pipeline, gzip, keep-alive, path traversal defense - the server worked. curl against it, everything came back correct. i called it done.
+
+then i decided to find out if that was true.
+
+---
+
+## then i audited my own code
+
+i went through it the way i'd want a staff engineer to review a pull request of mine: not "does the demo work," but "what happens under conditions i didn't happen to test." four real bugs came out of that, and every one of them lived specifically in the concurrency layer - the exact part of the codebase i was proudest of.
+
+### bug one: the lock that ate its own tail
+
+here's the original shutdown code:
+
+```python
+def stop(self):
+    self.running = False
+    with self.lock:
+        for conn in list(self.sessions.keys()):
+            self._close_connection(conn)
+        if self.server_socket:
+            self.selector.unregister(self.server_socket)
+            self.server_socket.close()
+        self.selector.close()
+    self.thread_pool.shutdown(wait=False)
+
+def _close_connection(self, conn):
+    with self.lock:
+        if conn in self.sessions:
+            del self.sessions[conn]
+            self.selector.unregister(conn)
+            conn.close()
+```
+
+read `stop()` on its own: looks fine. read `_close_connection()` on its own: also looks fine. the bug only exists in the space between them - `stop()` acquires `self.lock`, then calls `_close_connection()`, which tries to acquire `self.lock` *again*. `threading.Lock` is not reentrant. the second acquire blocks forever, on a lock the very same thread already holds.
+
+in practice this meant: hit Ctrl+C while any connection was open - which, since HTTP/1.1 defaults to keep-alive, was essentially always - and the process would never exit. every graceful shutdown was actually a hang, silently, for the entire life of the project.
+
+i didn't want to trust "i read the fix and it looks right" for a bug this specific, so i wrote a test that starts a real server on a real socket, opens a real keep-alive connection to it, and then asserts shutdown completes within a timeout:
+
+```python
+def test_shutdown_does_not_hang_with_open_keepalive_connection():
+    server, thread, port = _start_running_server()
+    with socket.create_connection(("127.0.0.1", port), timeout=2) as client:
+        client.sendall(b"GET / HTTP/1.1\r\nHost: localhost\r\n\r\n")
+        assert b"200 OK" in client.recv(4096)
+
+        server.running = False
+        thread.join(timeout=2)
+
+    assert not thread.is_alive(), "server.stop() hung - self-deadlock regression"
+```
+
+on the old code, this test hangs until the timeout and fails. the fix was to stop the reentrancy at the source: split `_close_connection` into a public version that acquires the lock, and an internal `_close_connection_locked` that assumes the caller already holds it.
+
+```python
+def _close_connection(self, conn):
+    with self.sessions_lock:
+        self._close_connection_locked(conn)
+
+def _close_connection_locked(self, conn):
+    if conn in self.sessions:
+        del self.sessions[conn]
+        self._selector_actions.put(("unregister", conn))
+        try:
+            conn.close()
+        except Exception:
+            pass
+```
+
+`stop()` now calls the `_locked` variant directly. no re-entry, no hang.
+
+### bug two: racing the selector
+
+`selectors.DefaultSelector` isn't safe to mutate from one thread while `select()` is in progress on another. and that's exactly what was happening: the event loop's `select()` call ran unguarded on the main thread, while worker threads called `selector.register()`/`unregister()` directly, whenever a keep-alive connection needed to go back on the loop or a completed request needed to drop off it before dispatch.
+
+this isn't the kind of bug that gives you a clean, repeatable crash. it's the kind that shows up as an occasional `RuntimeError` or `KeyError` buried inside the standard library's `selectors` module, under real concurrent load, that you can't reproduce on demand.
+
+the fix is a single-writer rule: worker threads never touch the selector. they post an action onto a queue instead, and only the event-loop thread ever calls `register()`/`unregister()`, draining that queue once per tick:
+
+```python
+def _drain_selector_actions(self):
+    while True:
+        try:
+            action, conn = self._selector_actions.get_nowait()
+        except queue.Empty:
+            return
+        if action == "register":
+            if conn in self.sessions:
+                self.selector.register(conn, selectors.EVENT_READ, self._read)
+        elif action == "unregister":
+            self.selector.unregister(conn)
+```
+
+a worker thread finishing a keep-alive response now does this instead of touching the selector itself:
+
+```python
+self._selector_actions.put(("register", conn))
+```
+
+one thread owns the selector for its entire lifetime. the race just isn't representable anymore.
+
+### bug three: `sendall()` lied to me
+
+this one i found while adding a feature, not during the initial audit: streaming large static files in chunks instead of loading them fully into memory. i wrote the streaming loop, tested it against a 2MB file, and the download came back truncated. no exception on the client side - just fewer bytes than the file actually had.
+
+the server logs had the answer:
+
+```
+Traceback (most recent call last):
+  File "app/core/server.py", line 229, in _process_request
+    response.write_to(conn, supports_gzip)
+  File "app/core/response.py", line 105, in write_to
+    conn.sendall(chunk)
+BlockingIOError: [Errno 35] Resource temporarily unavailable
+```
+
+every socket in this server is non-blocking, which is correct for the event loop. but worker threads were calling `conn.sendall()` on those same non-blocking sockets to send responses. a small response always fit in the OS send buffer in a single write, so this never came up. a 2MB file streamed across dozens of `sendall()` calls eventually filled that buffer mid-transfer - and a non-blocking socket doesn't wait for room, it raises `BlockingIOError` right there, aborting whatever was left of the response.
+
+worker threads are allowed to block - that's the entire reason they're not the event loop thread. so the fix is to let them:
+
+```python
+def _send_response(self, conn, response, supports_gzip=False):
+    conn.setblocking(True)
+    try:
+        response.write_to(conn, supports_gzip)
+    finally:
+        conn.setblocking(False)
+```
+
+blocking for the duration of the write, then back to non-blocking before the socket goes back to the event loop. i confirmed it with a real 2MB and a real 10MB file, byte-for-byte, not a mocked socket - the kind of bug that only tells the truth over an actual wire.
+
+### the traversal check that almost wasn't
+
+the server serves files under a sandboxed directory, and blocks anything that resolves outside it using `os.path.realpath()`. the original check:
+
+```python
+if not resolved_filepath.startswith(self.directory):
+    return HTTPResponse(status=403, ...)
+```
+
+looks reasonable. it's also the textbook CWE-22 partial-path bug: if the sandbox is `/data`, a *sibling* directory `/data-evil` also satisfies `startswith("/data")`, because the string `"data-evil"` starts with `"data"`. a bare prefix check on strings isn't the same thing as a check on paths.
+
+```python
+if not (resolved_filepath == self.directory
+        or resolved_filepath.startswith(self.directory + os.sep)):
+    return HTTPResponse(status=403, ...)
+```
+
+requiring the separator closes it. and because this is exactly the kind of bug that looks fine until you build the specific directory layout that breaks it, it gets a test that actually creates a sibling directory on disk and proves it's rejected, rather than trusting the diff by eye.
+
+---
+
+## what's still missing
+
+a "known limitations" list that never changes is worse than not having one - it just means nobody's checked it lately. so, honestly, as of today:
+
+- **single event loop thread.** it's async, but it's one thread. scaling across cores means running multiple processes bound to the same port with `SO_REUSEPORT` - which the socket setup already supports, it's just not wired up as a supervisor yet.
+- **no chunked transfer-encoding.** a request with `Transfer-Encoding: chunked` gets a clean `501` instead of being silently mis-parsed, which is what used to happen - it would get treated as a zero-length body and corrupt the next pipelined request on that connection. that's a correctness fix, not support for the feature.
+- **the idle timeout resets on any activity.** stalled connections get closed after 30 seconds of silence, which bounds ordinary Slowloris-style resource exhaustion - but a client that paces bytes just under that window indefinitely can still hold a slot open. closing that needs an absolute deadline from connection-open, independent of activity resets.
+- **no TLS, no auth, no rate limiting.** in front of real traffic this sits behind a reverse proxy that handles all three. it was never trying to be that layer.
+
+---
+
+## the actual lesson
+
+none of these four bugs were in the parts of the codebase i was worried about. the routing was fine. the middleware pipeline was fine. gzip, keep-alive, path parsing - all fine on first pass. every single bug lived in the concurrency model: the one piece of this project that was genuinely hard to write, that i'd already spent the most time on, that i was most confident about.
+
+that's sort of the whole point of auditing your own work instead of just shipping it once it runs. "it passed my manual testing" and "it's correct under concurrent load" are different claims, and the gap between them is exactly where a self-deadlock, a selector race, and a `BlockingIOError` were all quietly sitting, waiting for someone to actually go looking.
