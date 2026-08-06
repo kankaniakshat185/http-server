@@ -1,5 +1,7 @@
 # Custom Python HTTP Server & Web Framework
 
+[![Python CI](https://github.com/kankaniakshat185/custom-http-server/actions/workflows/tests.yml/badge.svg)](https://github.com/kankaniakshat185/custom-http-server/actions/workflows/tests.yml)
+
 A modular, high-performance HTTP/1.1 server and lightweight framework built from scratch in Python. It uses an event-driven networking architecture with non-blocking I/O (`selectors`), a task-dispatching worker thread pool, Express-style middleware, dynamic path variable routing, and persistent HTTP/1.1 connections - hardened with request-size limits, idle-connection timeouts, and a single-writer selector model, and backed by a 33-test pytest suite running in CI.
 
 Full write-up of the architecture and the concurrency bugs a self-audit found: [Behind the Sockets: What I Learned Building a Python HTTP Server](https://akshatkankani.vercel.app/tech-blog/custom-http-server)
