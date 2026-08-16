@@ -1,12 +1,3 @@
-export const metadata = {
-  title: 'Behind the Sockets: What I Learned Building a Python HTTP Server',
-  description:
-    'a raw-socket http/1.1 server in python - the whole architecture, and the four real concurrency bugs a self-audit found in code i thought was already correct.',
-  alternates: {
-    canonical: '/tech-blog/custom-http-server',
-  },
-};
-
 # Behind the Sockets: What I Learned Building a Python HTTP Server
 
 so, this one's about a project i've had running for a while now: a custom http/1.1 server, written from scratch in python. raw sockets, an event loop, a thread pool, routing, middleware - the whole thing, no `http.server`, no `asyncio`, no framework hiding underneath it doing the actual work.
@@ -21,7 +12,7 @@ grab a coffee, this is a long one.
 
 you can `pip install flask` in four seconds and never think about a socket again. so why not just do that?
 
-because "http server" is one of those things everyone uses and almost nobody has actually looked inside of. the moment you build one yourself, a whole pile of things you've been taking on faith stop being magic: what keep-alive actually is, why a raw TCP stream doesn't come with request boundaries built in, why `Content-Length` exists at all, what a thread pool is actually buying you under python's GIL. you can read about all of that in a blog post (like this one, i guess). but you don't really *understand* it until you've had to write the code that draws the line between "this is one request" and "this is the start of the next one" - byte by byte, off a socket that doesn't care how you feel about it.
+because "http server" is one of those things everyone uses and almost nobody has actually looked inside of. the moment you build one yourself, a whole pile of things you've been taking on faith stop being magic: what keep-alive actually is, why a raw TCP stream doesn't come with request boundaries built in, why `Content-Length` exists at all, what a thread pool is actually buying you under python's GIL, why a lock is more than just a word people say in interviews. you can read about all of that in a blog post (like this one, i guess). but you don't really *understand* it until you've had to write the code that draws the line between "this is one request" and "this is the start of the next one" - byte by byte, off a socket that doesn't care how you feel about it.
 
 that line, it turns out, is also exactly where most of the interesting bugs live. more on that later.
 
@@ -29,7 +20,11 @@ that line, it turns out, is also exactly where most of the interesting bugs live
 
 ## the event loop
 
-the server runs a single event loop thread on top of `selectors.DefaultSelector`, which wraps `epoll` on linux and `kqueue` on macOS/BSD depending on where it's running. every socket is non-blocking. the loop itself doesn't really *read* anything - it just asks the kernel "which of these sockets have something ready for me," and only bothers touching the ones that do.
+the server runs a single event loop thread on top of `selectors.DefaultSelector`, which wraps `epoll` on linux and `kqueue` on macOS/BSD depending on where it's running.
+
+it's worth naming what this is avoiding, because otherwise "event loop" just sounds like an arbitrary choice. two more obvious designs come to mind first. one: loop over every open socket yourself and ask each one "got anything for me?" - works, but gets slower the more connections pile up, since you're constantly re-checking sockets that almost certainly have nothing new. two: give every connection its own dedicated thread that just calls `.recv()` and sits there until data shows up - also works, but a thread costs real memory and OS bookkeeping, and a few thousand connections means a few thousand mostly-idle threads. `epoll`/`kqueue` sidestep both problems by moving the "who's ready" question into the kernel: you register the sockets you care about once, and a single call tells you which of them actually have something waiting, without you checking each one yourself or babysitting any of them with a dedicated thread.
+
+for that to work, every socket involved has to be non-blocking, which is worth actually defining rather than just asserting. a *blocking* call - a plain `.recv()` on a normal socket - pauses the calling thread until data arrives; if nothing's coming, that thread just sits there doing nothing. a *non-blocking* socket, set via `conn.setblocking(False)`, does the opposite: if there's no data ready, the call returns immediately (or raises an exception) instead of waiting around. every socket here is non-blocking, which is exactly what lets one thread be "in charge of" thousands of connections without ever getting stuck babysitting a single one of them.
 
 ```python
 def start(self):
@@ -47,7 +42,11 @@ def start(self):
         self._sweep_idle_connections()
 ```
 
-a new connection gets a session dict: a buffer, a per-connection lock, a timestamp. every time bytes arrive on that socket, they go through `_read`, which appends them to the buffer and checks for the `\r\n\r\n` that separates headers from body. once `Content-Length` is known and enough bytes have actually arrived, the request is complete, and at that point the socket gets pulled off the loop and the real work gets handed off elsewhere.
+`selector.register(sock, event_type, callback)` is the entire registration API: hand it a socket, say what kind of readiness you care about (`EVENT_READ`, always, here - this server never needs to know when a socket is *writable*, only when there's something new to read), and give it a function to call when that happens. `select(timeout=0.5)` is the actual "ask the kernel" step - it blocks until at least one registered socket is ready, or until half a second passes, whichever comes first, and hands back a list of `(key, mask)` pairs. `key.fileobj` is the socket itself, `key.data` is whatever callback you registered for it, and `mask` says which kind of event actually fired. `callback(key.fileobj, mask)` is just calling that function with those two things back - which is why `_accept` and `_read`, below, both take `(sock_or_conn, mask)` as their signature, even though neither one actually bothers looking at `mask`.
+
+the timeout matters for a reason that isn't obvious just from reading the code: if nothing's happening on any socket, `select()` would otherwise block forever, and this loop also needs to do two things that aren't triggered by any socket event at all - draining a queue of pending actions from other threads, and sweeping for connections that have gone quiet too long (more on both, later). capping the wait at half a second is what guarantees those two things still run regularly, even during a dead-quiet stretch with nothing coming in.
+
+a new connection gets a session dict - a buffer for raw bytes, a lock scoped to just that one connection, and a timestamp - and every time bytes arrive, they go through `_read`, which appends them to the buffer and checks for `\r\n\r\n`. that's not an arbitrary separator - it's the HTTP spec's own definition of the boundary between headers and body. once that boundary shows up, the buffer gets split into the header block and whatever came after it, and the header block reveals `Content-Length`: how many bytes long the body is supposed to be. that number matters because there's no other reliable way to know where the body ends - it's arbitrary data, could be anything, so scanning it for a terminator the way `\r\n\r\n` terminates the headers isn't safe; the body itself might just happen to contain those exact bytes somewhere in the middle. once enough bytes have actually arrived to satisfy `Content-Length`, the request is complete, the socket gets pulled off the loop, and the real work gets handed off somewhere else entirely - which is worth its own section, next.
 
 ```python
 def _read(self, conn, mask):
@@ -64,13 +63,35 @@ def _read(self, conn, mask):
         self._dispatch_if_complete(conn, session)
 ```
 
-none of this blocks, anywhere. a slow client sending one byte every few seconds doesn't tie anything up - the event loop just doesn't get called for that socket again until more data actually shows up. that's really the whole point of the design, and it's a nice thing to internalize: the loop isn't "waiting" on anyone, it's just responding to whoever's ready.
+the per-connection lock (`session["lock"]`) exists because this session dict can end up getting touched from more than one place at once, and the timestamp exists to support a feature that shows up much later in this post - an idle-connection timeout. hang onto both of those; they matter again.
+
+none of this blocks, anywhere. a slow client sending one byte every few seconds doesn't tie anything up - the event loop just doesn't get called for that socket again until more data actually shows up, and in the meantime it's free to service every other connection. that's really the whole point of the design.
+
+---
+
+## handing requests off to a thread pool (and the gil question everyone asks)
+
+here's the thing the last section skipped past: `_read` detects a complete request, unregisters the socket, and hands it to something called `self.thread_pool` - it doesn't run a route handler itself, doesn't touch the filesystem, doesn't do any of the actual work. that's deliberate, and it's worth stopping to explain, because it's also where the concurrency concept that causes half the bugs later in this post shows up for the first time.
+
+reading bytes off a socket is cheap and non-blocking, which is exactly why the event loop can do it directly. running a route handler, or reading and writing a file from disk, is neither of those things - and python doesn't have a non-blocking way to read a file. so instead of doing that work on the one thread that's supposed to stay responsive to every connection at once, it gets handed off to a `ThreadPoolExecutor`: a fixed number of worker threads, created once up front, sitting around waiting for tasks.
+
+```python
+self.thread_pool.submit(self._process_request, conn, addr, headers_to_process, body)
+```
+
+`submit()` drops a task - a function plus its arguments - onto an internal queue. whichever worker thread is free next picks it up and runs it. no manual thread creation per request, nothing to clean up afterward, just a bounded number of threads getting reused for however many requests come through.
+
+now, the GIL question. python's Global Interpreter Lock means that at any given instant, only one thread is allowed to be executing python bytecode - full stop, no matter how many CPU cores the machine has. so if this server were doing CPU-heavy work across threads - image resizing, parsing something huge, hashing - a thread pool wouldn't actually parallelize any of it, and you'd want a `ProcessPoolExecutor` instead, which sidesteps the GIL entirely by using separate OS processes rather than threads. but this server is I/O-bound, not CPU-bound - it spends almost all its time waiting on a socket or a disk, not crunching numbers. and when a thread makes a system call like `conn.recv()`, `conn.sendall()`, or `open(path).read()`, python releases the GIL for the duration of that call. so while one worker is blocked on a disk read, a second worker can be running python code, and a third can be blocked sending bytes to a completely different client. the GIL never actually gets in the way here.
+
+one more thing worth being precise about, because it matters a lot later: the GIL stops two threads from running python bytecode *at the exact same instant*. it does not stop them from interleaving - thread A running a few instructions, getting paused mid-operation, thread B running a few of its own, A resuming later. if two threads are reading and writing the same piece of shared state - a dict, a list, any object more than one thread can reach - without something explicitly protecting it, that interleaving can still corrupt it, GIL or no GIL. that's what a lock (`threading.Lock`, which shows up constantly in this codebase) is actually for: it's a gate one thread can hold that forces every other thread to wait its turn before touching the same data. "python has a GIL, so it's basically single-threaded, races can't really happen" is a genuinely common assumption, and it's genuinely wrong - and it's exactly the wrong assumption that let bug two, later in this post, exist in the first place.
+
+with that settled - one thread reading, a pool of threads doing the actual work, and a lock as the thing standing between them and chaos - here's what a worker thread actually does first, the moment it picks up a request.
 
 ---
 
 ## turning bytes into a request object
 
-by the time `_process_request` runs, we've got two blobs of bytes: the header block, and the body. neither means anything yet. `HTTPRequest.parse` is what turns that into something a route handler can actually work with.
+by the time `_process_request` runs - on a worker thread, per the section above, never on the event loop - we've got two blobs of bytes: the header block, and the body. neither means anything yet. `HTTPRequest.parse` is what turns that into something a route handler can actually work with.
 
 ```python
 @classmethod
@@ -109,7 +130,9 @@ def parse(cls, headers_part: bytes, body_part: bytes) -> 'HTTPRequest':
                query_params=query_params, version=version)
 ```
 
-a couple of small decisions in there matter more than they look. headers get lowercased on the way in, which is the whole trick behind case-insensitive lookups later - `request.get_header("Content-Type")` and `request.get_header("content-type")` end up hitting the same dict key, because we never store the client's original casing. and the request line only needs three space-separated tokens to be considered *parseable* - it doesn't validate that the method is a real HTTP method, or that the path looks like a path. that's on purpose, mostly: this layer's job is framing, not validation. if the request line genuinely doesn't have three parts, that's the one thing it does refuse outright, by raising instead of limping along with `None`s.
+a handful of small decisions in there matter more than they look. headers get lowercased on the way in, which is the whole trick behind case-insensitive lookups later - `request.get_header("Content-Type")` and `request.get_header("content-type")` end up hitting the same dict key, because we never store the client's original casing to begin with. the query string handling has its own quiet decision baked in too: `?key=value&flag` splits into `{"key": "value", "flag": ""}` - a bare key with no `=` still gets an entry, just with an empty string instead of getting silently dropped, on the theory that a client sending `?debug` probably means something by it even without a value attached. and `.decode("utf-8", errors="ignore")` is doing its own quiet thing: if a client sends bytes that aren't valid UTF-8, whether by accident or on purpose, this doesn't crash - it just drops whatever doesn't decode and carries on with what's left, a defensive choice, since the alternative is letting a client crash request parsing just by sending malformed bytes on purpose.
+
+the request line only needs three space-separated tokens to be considered *parseable* - it doesn't validate that the method is a real HTTP method, or that the path looks like a path. that's on purpose, mostly: this layer's job is framing, not validation. if the request line genuinely doesn't have three parts, though, that's the one thing it does refuse outright, by raising instead of limping along with `None`s.
 
 ---
 
@@ -143,7 +166,7 @@ def _match_path(self, pattern: str, path: str):
     return True, params
 ```
 
-split both the pattern and the actual path on `/`, drop the empty segments (which quietly handles trailing slashes for free), and walk them together. a segment starting with `:` is a capture, anything else has to match literally. `/echo/:string` against `/echo/hello` gives you `{"string": "hello"}`. that's the entire routing engine. it's O(n) per lookup and doesn't care, because nobody's registering ten thousand routes on a toy server.
+split both the pattern and the actual path on `/`, drop the empty segments (which quietly handles trailing slashes for free - `/echo/hello/` splits to the same non-empty parts as `/echo/hello`), and walk them together. a segment starting with `:` is a capture, anything else has to match literally. `/echo/:string` against `/echo/hello` gives you `{"string": "hello"}`. that's the entire routing engine. it's O(n) per lookup - checking each registered route one at a time rather than anything cleverer - and doesn't care, because nobody's registering ten thousand routes on a toy server.
 
 one thing that *wasn't* in the original version, though: `match()` only ever tells you "yes, exactly this method and path" or "no." it can't tell you "the path exists, you just used the wrong verb" - so a `POST` to a `GET`-only route and a `POST` to a path that doesn't exist at all looked identical, both a flat `404`. that's a real correctness gap - a `404` should mean "nothing's here," a `405` should mean "something's here, wrong verb" - so `allowed_methods()` exists specifically to answer that second question, walking every registered method's patterns against the path independent of what the actual request used:
 
@@ -159,7 +182,7 @@ def allowed_methods(self, path: str) -> list:
     return methods
 ```
 
-the dispatch logic tries an exact match first, and only falls back to `allowed_methods()` - and a `405` with a populated `Allow` header - if that fails and something else on the path did match.
+the dispatch logic tries an exact match first, and only falls back to `allowed_methods()` - and a `405` with a populated `Allow` header, a real HTTP response header whose entire job is telling the client which methods would actually have worked - if that fails and something else on the path did match.
 
 ---
 
@@ -184,7 +207,13 @@ class MiddlewarePipeline:
         return dispatch(0)
 ```
 
-that's the entire chain-of-responsibility pattern in twelve lines. every middleware is just a function (or a callable object, either works) shaped like `(request, next_handler) -> HTTPResponse`. call `next_handler(request)` and control passes to whoever's next in line; don't call it, and the chain stops right there - which is exactly what you want for something like auth middleware that short-circuits on a bad token, even though this project doesn't have auth. `logger_middleware` is the plainest example: it calls `next_handler(request)`, catches whatever comes back (or whatever exception blows up), and logs either way.
+this is a real, named design pattern - chain of responsibility - which just means a request passes through a sequence of handlers in order, and each one gets to decide whether to act on it, pass it along, or both. "onion" is the mental image people reach for, because of what actually happens when you trace a request through it, so let's trace one.
+
+`execute()` kicks things off with `dispatch(0)` - handle middleware zero. `dispatch(index)` looks up the middleware at that index and calls it, but it doesn't just hand that middleware the request and walk away - it hands it the request *and* a tiny function, `lambda req: dispatch(index + 1)`, that the middleware can call whenever it decides it's done. that lambda is a closure: it "remembers" the current `index` from the moment it was created, so calling it later still knows exactly which middleware comes next. if the middleware calls that function - conventionally named `next_handler` - you're back inside `dispatch`, one level deeper, doing the same thing again for the next middleware in line. run out of middlewares, and `dispatch` calls `final_handler` instead - the actual route handler, the center of the onion.
+
+here's the part that makes the metaphor earn its keep, though: this is all built out of ordinary function calls, so it behaves like nested function calls always do - `dispatch(0)` doesn't return until whatever it called (middleware zero, or `dispatch(1)`, or eventually `final_handler`) returns first. so once you've gone all the way in and gotten a response back, that response travels back *out* through every layer you passed through on the way in, in reverse order, and each layer gets a chance to look at it, change it, or just pass it straight through before its own caller ever sees it. every middleware is a function shaped like `(request, next_handler) -> HTTPResponse`: call `next_handler(request)` and you're going deeper in; whatever it hands back is your own return value coming back out.
+
+which is exactly what `logger_middleware` does - the plainest possible example:
 
 ```python
 def logger_middleware(request, next_handler) -> HTTPResponse:
@@ -198,13 +227,17 @@ def logger_middleware(request, next_handler) -> HTTPResponse:
     return response
 ```
 
-which, by the way, is also the server's only safety net for a route handler throwing an unhandled exception - without this middleware in the pipeline, a bug in your own route code would take the whole connection down instead of degrading to a clean `500`.
+it goes in (`next_handler(request)`), waits for everything deeper than it to finish and come back, and only *then* logs the final status code - because until `next_handler` actually returns, it has no idea what that status is going to be. and if a middleware decides *not* to call `next_handler` at all - imagine an auth check that just returns a `401` on a bad token, which this project doesn't have but easily could - the chain simply stops there, right where it is. nothing deeper ever runs. that's the short-circuit case, and it's really the whole reason this pattern is worth building instead of just calling a list of functions in a row.
+
+one more thing worth noticing, since it's easy to miss on a first read: this same `try/except` is also the server's *only* safety net against a route handler throwing an unhandled exception. without `logger_middleware` sitting in the pipeline, a bug in your own route code would take the whole connection down with it, instead of degrading to a clean `500`.
 
 ---
 
 ## keep-alive, and the part everyone forgets about
 
-HTTP/1.1 defaults to persistent connections - the client doesn't reopen a TCP connection for every request, it just sends another one down the same pipe once the last response finishes. which sounds simple until you actually have to implement the "once the last response finishes" part, because a single `recv()` call has zero concept of where one request ends and the next begins. if a client pipelines two requests back to back in the same TCP segment, you might read *both* of them in one `conn.recv(4096)` call.
+HTTP/1.1 defaults to persistent connections - the client doesn't reopen a TCP connection for every request, it just sends another one down the same pipe once the last response finishes. worth spelling out why that's worth doing at all: opening a TCP connection in the first place costs a round trip before a single byte of actual HTTP gets exchanged - a three-way handshake, where the client sends a SYN, the server replies with a SYN-ACK, and the client replies with an ACK, and only after that little back-and-forth is the connection actually usable. pay that cost on every single request and it adds up fast, especially on a slow or high-latency link; keep-alive means paying it once and reusing the same open connection for everything after.
+
+which sounds simple until you actually have to implement the "once the last response finishes" part, because a single `recv()` call has zero concept of where one request ends and the next begins. if a client pipelines two requests back to back in the same TCP segment - one chunk of bytes as it actually goes out over the wire, which doesn't necessarily line up with what you'd call one "request" - you might read *both* of them in one `conn.recv(4096)` call.
 
 that's what the `leftover` handling in `_dispatch_if_complete` is for - once a full request's been sliced off the front of the buffer, whatever's left over stays in the session instead of getting thrown away:
 
@@ -215,7 +248,7 @@ leftover = session["body_part"][session["content_length"]:]
 session["buffer"] = leftover
 ```
 
-and after the worker thread sends a response, if the connection is meant to stay open, that leftover buffer gets checked immediately (`_check_buffered_request`) in case a second pipelined request is already sitting there waiting, instead of going back to the event loop and waiting for a `recv()` event that might never come because there's nothing left to receive - the bytes already arrived, they're just sitting in memory.
+and after the worker thread sends a response, if the connection is meant to stay open, that leftover buffer gets checked immediately (`_check_buffered_request`) in case a second pipelined request is already sitting there waiting, instead of going back to the event loop and waiting for a `recv()` event that might never come - because there's nothing left to receive, the bytes already arrived, they're just sitting in memory unread.
 
 whether a connection stays open at all comes down to one line:
 
@@ -223,15 +256,15 @@ whether a connection stays open at all comes down to one line:
 is_keep_alive = (request.version == "HTTP/1.1" and conn_header != "close") or (conn_header == "keep-alive")
 ```
 
-HTTP/1.1 without an explicit `Connection: close` stays open. HTTP/1.0 stays closed unless the client explicitly asks for `keep-alive`. small line, but it's the difference between every request paying for a fresh TCP handshake and most of them not having to.
+HTTP/1.1 without an explicit `Connection: close` stays open. HTTP/1.0 stays closed unless the client explicitly asks for `keep-alive`. small line, but it's the difference between every request paying for a fresh handshake and most of them not having to.
 
 ---
 
 ## gzip, mime types, and the unglamorous middle
 
-nobody writes a blog post about content negotiation because it's not exciting, but it's the kind of thing that's invisible when it works and confusing when it doesn't, so here it is anyway.
+nobody writes a blog post about content negotiation because it's not exciting, but it's the kind of thing that's invisible when it works and confusing when it doesn't, so here it is anyway. the general idea is simple even if the name sounds formal: the client and server agree on *how* a resource gets represented on the wire - compressed or not, in what format - through a back-and-forth of request and response headers, rather than the server always sending the exact same bytes to whoever asks.
 
-when a route handler or the static file middleware returns a response, `HTTPResponse.to_bytes()` checks whether the client sent `Accept-Encoding: gzip` and, if so, compresses the body before it goes on the wire:
+the specific case here is compression. sending fewer bytes means a faster transfer, especially on a slow connection - that's the entire case for bothering with gzip at all. when a route handler or the static file middleware returns a response, `HTTPResponse.to_bytes()` checks whether the client sent `Accept-Encoding: gzip` - telling the server it knows how to decompress gzip on its own end - and, if so, compresses the body before it goes on the wire:
 
 ```python
 if client_supports_gzip and self._should_compress(resp_headers, len(response_body)):
@@ -239,7 +272,7 @@ if client_supports_gzip and self._should_compress(resp_headers, len(response_bod
     resp_headers["content-encoding"] = "gzip"
 ```
 
-the `_should_compress` check is the part that actually matters, though. compressing an already-compressed file - a jpeg, a zip, a video - burns CPU for basically nothing, and can occasionally make the output *bigger*. so it's skipped by content-type:
+the `_should_compress` check is the part that actually matters, though. compressing an already-compressed file - a jpeg, a zip, a video - burns CPU for basically nothing, and can occasionally make the output *bigger*, since most compressed formats are already close to the theoretical limit of how small that data can get. so it's skipped by content-type:
 
 ```python
 def _should_compress(self, resp_headers, body_len):
@@ -250,6 +283,8 @@ def _should_compress(self, resp_headers, body_len):
         return False
     return content_type not in self._NON_COMPRESSIBLE_TYPES
 ```
+
+that `.split(";", 1)[0]` is quietly doing real work - a content-type header can carry extra parameters after a semicolon, like `text/html; charset=utf-8`, so this strips that off before comparing. without it, `text/html; charset=utf-8` would never match a plain `"text/html"` check, and every HTML response would silently skip the compressibility check entirely.
 
 and the content-type itself, for files served off disk, comes from python's own `mimetypes` module rather than anything custom - `mimetypes.guess_type(filepath)` looks at the extension and hands back something reasonable, falling back to `application/octet-stream` when it has no idea what it's looking at. not glamorous. correct, though, which is the actual bar.
 
@@ -281,13 +316,15 @@ with open(self.stream_path, "rb") as f:
         conn.sendall(chunk)
 ```
 
+`sendall()` is worth pinning down here, since it matters again later: it's different from the lower-level `send()`, where a single call isn't actually guaranteed to push every byte you hand it in one go over a busy connection. `sendall()` is the version that loops internally and keeps calling `send()` until everything you gave it is actually out the door - which is exactly why it's used here for a chunk-by-chunk streaming loop instead of `send()`.
+
 memory usage for a response is now bounded by the chunk size, not the file size. a 10GB file and a 10KB file cost the same amount of RAM to send. (this is also where bug three below comes from, so keep this section in mind.)
 
 ---
 
 ## shipping it
 
-none of this is worth much if it only runs on my laptop, so it's containerized - a `python:3.13-slim` base, the `app/` package copied in, and the entry point pointed at a `/data` volume for wherever files get uploaded:
+none of this is worth much if it only runs on my laptop, so it's containerized. quick grounding if you haven't used docker before: a container is an isolated process with its own filesystem view and its own installed dependencies, built from a recipe (the `Dockerfile`) into a reusable image. it's not a full virtual machine - it shares the host machine's kernel rather than emulating an entire OS underneath it, which is why a container starts in milliseconds instead of the minute or two a VM usually takes to boot.
 
 ```dockerfile
 FROM python:3.13-slim
@@ -297,6 +334,8 @@ EXPOSE 4221
 ENV PYTHONPATH=/workspace
 CMD ["python3", "-u", "app/main.py", "--directory", "/data"]
 ```
+
+line by line: `FROM` picks the base image to build on top of - a minimal python 3.13 install, not the full default image, to keep the final image small. `WORKDIR` sets the directory everything after it runs relative to. `COPY app/ ./app/` copies the actual source code into the image. `EXPOSE 4221` is worth being precise about, because it's a genuinely common point of confusion - it doesn't actually open or publish anything on its own, it's purely documentation, a note to whoever's reading the Dockerfile (or tooling that parses it) that this container expects traffic on port 4221. the real port-publishing happens in compose, below. `ENV PYTHONPATH=/workspace` is what makes `from app.core...` imports resolve correctly once the code's actually running inside the container. and `CMD` is the command that runs when a container starts.
 
 and compose just wires up the port and a bind mount so uploaded files land on the actual host filesystem instead of vanishing the moment the container gets torn down:
 
@@ -310,11 +349,13 @@ services:
       - ./sandbox:/data
 ```
 
+`ports` is the actual publish step that `EXPOSE` only documented - host port 4221 forwards to container port 4221. `volumes` is the bind mount: it links a folder on the host machine (`./sandbox`) to a path inside the container (`/data`), so anything written to `/data` from inside the container is really landing straight on your actual disk. without it, every file uploaded through this server would disappear the moment the container stopped.
+
 `python3 -u` matters more than it looks like it should - without unbuffered output, logs sit in an internal buffer and never show up in `docker-compose logs` until the buffer fills or the process exits, which makes debugging a running container feel like shouting into a void.
 
 ---
 
-with all of that built - event loop, parsing, routing, middleware, keep-alive, gzip, streaming, a container to ship it in - the server *worked*. curl against it, everything came back correct. every endpoint did what it said it would.
+with all of that built - event loop, thread pool, parsing, routing, middleware, keep-alive, gzip, streaming, a container to ship it in - the server *worked*. curl against it, everything came back correct. every endpoint did what it said it would.
 
 so i called it done. which, in hindsight, was the mistake.
 
@@ -350,7 +391,7 @@ def _close_connection(self, conn):
             conn.close()
 ```
 
-read `stop()` on its own: looks fine. read `_close_connection()` on its own: also looks fine. the bug only exists in the *space between them* - `stop()` acquires `self.lock`, then calls `_close_connection()`, which tries to acquire the exact same lock again. `threading.Lock` is not reentrant. the second acquire just... blocks. forever. on a lock the very same thread already holds.
+read `stop()` on its own: looks fine. read `_close_connection()` on its own: also looks fine. the bug only exists in the *space between them* - `stop()` acquires `self.lock`, then calls `_close_connection()`, which tries to acquire the exact same lock again. a lock, as covered a couple of sections back, is a gate that only lets one thread through at a time - which normally means *other* threads wait their turn. this isn't that. it's the *same* thread trying to walk back through a gate it's already standing inside of. `threading.Lock` doesn't special-case that: it has no memory of who's currently holding it, just whether it's held. the second acquire just blocks, waiting for the lock to be released - by a thread that can't release it, because it's stuck waiting on that same acquire. forever.
 
 in practice: hit Ctrl+C while any connection was open - which, since keep-alive is the HTTP/1.1 default, was essentially every time - and the process would never exit. every graceful shutdown i'd ever run was actually a silent hang, for the entire life of the project, and i had genuinely never noticed, because who sits there timing how long Ctrl+C takes.
 
@@ -369,7 +410,7 @@ def test_shutdown_does_not_hang_with_open_keepalive_connection():
     assert not thread.is_alive(), "server.stop() hung - self-deadlock regression"
 ```
 
-on the old code, this hangs until the timeout and fails, which is exactly what i wanted to see once, on purpose, before trusting the fix. the fix itself is small: split `_close_connection` into a public version that acquires the lock, and an internal `_close_connection_locked` that assumes the caller already holds it.
+`thread.join(timeout=2)` means "wait up to 2 seconds for this thread to actually finish, then give up and continue regardless" - which is exactly what lets the test detect a hang instead of hanging itself. on the old code, this test hangs until that timeout and then fails on the final assertion, which is exactly what i wanted to see once, on purpose, before trusting the fix. the fix itself is small: split `_close_connection` into a public version that acquires the lock, and an internal `_close_connection_locked` that assumes the caller already holds it.
 
 ```python
 def _close_connection(self, conn):
@@ -392,9 +433,9 @@ def _close_connection_locked(self, conn):
 
 `selectors.DefaultSelector` isn't safe to mutate from one thread while `select()` is in progress on another - and that's exactly what was happening. the event loop's `select()` call ran unguarded on the main thread, while worker threads called `selector.register()` / `unregister()` directly, any time a keep-alive connection needed to go back on the loop, or a completed request needed to drop off it before dispatch.
 
-this isn't the kind of bug that gives you a clean, repeatable crash you can point at. it's the kind that shows up as an occasional `RuntimeError` or `KeyError` buried somewhere inside the standard library's `selectors` module, under real concurrent load, on a machine you're not sitting in front of, that you then can't reproduce on demand no matter how hard you try.
+this is precisely the GIL misconception from a few sections back, playing out for real. "python threads can't really race, there's a GIL" would predict this is fine. it isn't, because the GIL only stops two threads from executing bytecode at the exact same instant - it doesn't stop `select()`, mid-read of the selector's internal bookkeeping, from getting interrupted by another thread mutating that same bookkeeping via `register()`. and this isn't the kind of bug that gives you a clean, repeatable crash you can point at, either - it's the kind that shows up as an occasional `RuntimeError` or `KeyError` buried somewhere inside the standard library's `selectors` module, under real concurrent load, on a machine you're not sitting in front of, that you then can't reproduce on demand no matter how hard you try.
 
-the fix is a single-writer rule: worker threads don't touch the selector at all, ever. they post an action onto a queue instead, and only the event-loop thread ever calls `register()` / `unregister()`, draining that queue once per tick:
+the fix is a single-writer rule: worker threads don't touch the selector at all, ever. they post an action onto a `queue.Queue` instead - a queue built to be safely shared across threads, unlike a plain list - and only the event-loop thread ever calls `register()` / `unregister()`, draining that queue once per tick:
 
 ```python
 def _drain_selector_actions(self):
@@ -422,7 +463,7 @@ one thread owns the selector for its entire life. the race isn't just fixed, it'
 
 this one i actually found while adding the streaming feature above, not during the initial audit. i wrote the chunked read/write loop, tested it against a 2MB file, and the download came back truncated. no exception on the client side, curl just quietly handed me fewer bytes than the file actually had. that's a genuinely unsettling kind of bug to stare at.
 
-the server logs had the answer, though:
+the server logs had the answer, though - this traceback is from the moment the bug actually happened, before the fix existed, so don't go looking for these exact line numbers in the current code:
 
 ```
 Traceback (most recent call last):
@@ -433,7 +474,7 @@ Traceback (most recent call last):
 BlockingIOError: [Errno 35] Resource temporarily unavailable
 ```
 
-every socket in this server is non-blocking, which is correct for the event loop's side of things. but worker threads were also calling `conn.sendall()` on those same non-blocking sockets, directly, to send responses. a small response always fit in the OS send buffer in one write, so this never surfaced - not once, in months of testing. a 2MB file streamed across dozens of `sendall()` calls, though, eventually fills that buffer mid-transfer, and a non-blocking socket doesn't politely wait for room to open up. it just raises `BlockingIOError` right there, aborting whatever was left of the response and leaving the client holding a truncated file.
+`Errno 35` there is POSIX for `EWOULDBLOCK` (also seen as `EAGAIN` depending on platform) - the standard, cross-language error for "this would have had to block, and you told me not to let it." every socket in this server is non-blocking, which is correct for the event loop's side of things, as covered earlier - a non-blocking `recv()` or `send()` returns immediately instead of waiting, by design. but worker threads were also calling `conn.sendall()` directly on those same non-blocking sockets to send responses. under the hood, the OS keeps a fixed-size send buffer for each socket - a chunk of kernel memory holding data that's been handed off but not yet actually transmitted over the wire - and a small response always fit inside that buffer in a single write, so this never surfaced, not once, in months of testing. a 2MB file streamed across dozens of `sendall()` calls, though, eventually fills that buffer mid-transfer. a *blocking* socket would just pause and wait for the OS to drain some of it out over the network, freeing up room. a *non-blocking* one refuses to wait at all - it raises `BlockingIOError` right there, aborting whatever was left of the response and leaving the client holding a truncated file.
 
 worker threads are allowed to block, though - that's the entire reason they're not running on the event loop thread in the first place. so the fix is just to let them, for exactly as long as they need to:
 
@@ -450,14 +491,14 @@ blocking mode for the duration of the write, then back to non-blocking before th
 
 ### the traversal check that almost wasn't
 
-the server serves files under a sandboxed directory, and is supposed to block anything that resolves outside it, using `os.path.realpath()` to collapse away any `..` tricks. the original check:
+the server serves files under a sandboxed directory, and is supposed to block anything that resolves outside it, using `os.path.realpath()` to collapse away any `..` tricks. worth being concrete about what that means: `..` is a literal filesystem token meaning "go up one directory," and if you just concatenate strings (`os.path.join(directory, "../../etc/passwd")`) without resolving what that actually points to, you get a path string that *looks* like it's inside `directory` but very much isn't. `realpath()` walks the whole path against the real filesystem - following `..` up, following any symlinks along the way - and hands back the actual, final, absolute location that path resolves to. the original check took that resolved path and did this:
 
 ```python
 if not resolved_filepath.startswith(self.directory):
     return HTTPResponse(status=403, ...)
 ```
 
-looks reasonable at a glance. it's also the textbook CWE-22 partial-path bug. if the sandbox is `/data`, a *sibling* directory called `/data-evil` also satisfies `startswith("/data")` - because the string `"data-evil"` genuinely does start with `"data"`. a check on strings isn't the same thing as a check on paths, even though it's very easy to write code that quietly assumes it is.
+looks reasonable at a glance. it's also the textbook CWE-22 partial-path bug - CWE-22 being the standard catalog entry (Common Weakness Enumeration, a public list of well-known vulnerability patterns) for exactly this shape of mistake. if the sandbox is `/data`, a *sibling* directory called `/data-evil` also satisfies `startswith("/data")` - because the string `"data-evil"` genuinely does start with `"data"`. a check on strings isn't the same thing as a check on paths, even though it's very easy to write code that quietly assumes it is.
 
 ```python
 if not (resolved_filepath == self.directory
@@ -473,10 +514,10 @@ requiring the trailing separator closes it. and because this is exactly the kind
 
 a "known limitations" list that never gets updated is worse than not having one at all - it just means nobody's actually checked it lately. so, honestly, as of today:
 
-- **single event loop thread.** it's async, but it's one thread. scaling across cores means running multiple processes bound to the same port with `SO_REUSEPORT` - which the socket setup already supports, it's just not wired up as an actual supervisor yet.
-- **no chunked transfer-encoding.** a request with `Transfer-Encoding: chunked` gets a clean `501` instead of being silently mis-parsed, which is what used to happen - it'd get treated as a zero-length body and quietly corrupt the next pipelined request on that connection. that's a correctness fix, to be clear, not support for the feature.
-- **the idle timeout resets on any activity.** stalled connections get closed after 30 seconds of silence, which bounds ordinary Slowloris-style resource exhaustion - but a client that paces bytes just under that window, indefinitely, can still hold a slot open forever. closing that properly needs an absolute deadline from connection-open, independent of activity resets, and that's not built yet.
-- **no TLS, no auth, no rate limiting.** in front of real traffic this would sit behind a reverse proxy that handles all three. it was never trying to be that layer, and i don't think it should be.
+- **single event loop thread.** it's async, but it's one thread, on one CPU core. scaling across cores means running multiple separate processes, all bound to the same port, using the `SO_REUSEPORT` socket option - which tells the kernel "let more than one socket claim this exact port, and load-balance new connections across whichever ones are listening." the socket setup here already passes that option in, it's just not wired up to an actual supervisor that runs several processes yet.
+- **no chunked transfer-encoding.** worth actually explaining what that is, since it comes up here for the first time: it's an alternative to `Content-Length` for when the server (or client) doesn't know the total body size upfront - streaming a response as it's generated, say - so instead of declaring a length, the body goes out as a series of size-prefixed chunks, ending with a zero-length chunk to mark the end. this server doesn't implement that, and a request with `Transfer-Encoding: chunked` now gets a clean `501` instead of being silently mis-parsed, which is what used to happen - it'd get treated as a zero-length body and quietly corrupt the next pipelined request on that connection. that's a correctness fix, to be clear, not support for the feature itself.
+- **the idle timeout resets on any activity.** stalled connections get closed after 30 seconds of silence, which is meant to bound a Slowloris-style attack - a client that opens a connection and sends data agonizingly slowly, on purpose, to tie up server resources without ever completing a request. this server's event-loop design already blunts the classic version of that attack, since a slow connection never ties up a whole thread the way it would in a thread-per-connection server - it just sits as a cheap dict entry until the timeout catches it. but the timeout itself has a real gap: it resets on *any* activity, so a client that sends one byte every 29 seconds, forever, keeps resetting the 30-second clock and is never caught by it, holding the slot open indefinitely. closing that properly needs an absolute deadline measured from when the connection first opened, independent of activity resets, and that's not built yet.
+- **no TLS, no auth, no rate limiting.** TLS is what encrypts traffic between client and server so a third party watching the network can't read or tamper with it - this server doesn't do that itself. in front of real traffic, it would sit behind a reverse proxy - a separate server that sits in front of this one, terminates TLS, and forwards plain HTTP through - that also handles auth and rate limiting. it was never trying to be that layer, and i don't think it should be.
 
 ---
 
